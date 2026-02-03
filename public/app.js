@@ -18,6 +18,7 @@ if (!firebase.apps.length) {
 
 const auth = firebase.auth();
 const dbFS = firebase.firestore();
+const storage = firebase.storage();
 const provider = new firebase.auth.GoogleAuthProvider();
 
 /* ==========================================================================
@@ -33,9 +34,10 @@ const contactsRef = () => userDocRef().collection("contacts");
 const campaignsRef = () => userDocRef().collection("campaigns");
 const schedulesRef = () => userDocRef().collection("schedules");
 const logsRef = () => userDocRef().collection("logs");
+const mediaRef = () => userDocRef().collection("media");
 
 /* ==========================================================================
-   3. Firestore Data Helpers (CRUD Contacts & Campaigns)
+   3. Firestore Data Helpers (CRUD Contacts, Campaigns & Media)
    ========================================================================== */
 
 // --- CONTACTS ---
@@ -92,6 +94,58 @@ async function fsDeleteCampaign(id) {
     return await campaignsRef().doc(id).delete();
 }
 
+// --- MEDIA (Firestore + Storage) ---
+async function fsListMedia() {
+    const snap = await mediaRef().orderBy("createdAt", "desc").get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function uploadMediaFile(file, aliasOpt) {
+    const u = auth.currentUser;
+    if (!u) throw new Error("No auth");
+
+    const docRef = mediaRef().doc(); // ID generado
+    const mediaId = docRef.id;
+    const fullPath = `users/${u.uid}/media/${mediaId}/${file.name}`;
+    const storageRef = storage.ref().child(fullPath);
+
+    // Subir a Storage
+    const snapshot = await storageRef.put(file);
+    const url = await snapshot.ref.getDownloadURL();
+
+    // Guardar Metadata en Firestore
+    const type = file.type.startsWith("video") ? "video" : "image";
+    const payload = {
+        name: file.name,
+        alias: aliasOpt || file.name,
+        type: type,
+        contentType: file.type,
+        size: file.size,
+        fullPath: fullPath,
+        url: url,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+
+    await docRef.set(payload);
+    return mediaId;
+}
+
+async function fsDeleteMedia(mediaId) {
+    const docSnap = await mediaRef().doc(mediaId).get();
+    if (docSnap.exists) {
+        const data = docSnap.data();
+        if (data.fullPath) {
+            try {
+                await storage.ref().child(data.fullPath).delete();
+            } catch (e) {
+                console.warn("Archivo en Storage no encontrado o ya borrado", e);
+            }
+        }
+        await mediaRef().doc(mediaId).delete();
+    }
+}
+
 // --- KPI DASHBOARD ---
 async function getDashboardKPIsFS() {
     const kpis = { totalContacts: 0, totalCampaigns: 0, scheduledPending: 0, logs24h: 0 };
@@ -106,7 +160,6 @@ async function getDashboardKPIsFS() {
         kpis.totalCampaigns = cmpSnap.size;
         kpis.scheduledPending = schSnap.size;
 
-        // Logs 24h (Asumiendo campo ts ISO string por ahora)
         const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
         const lSnap = await logsRef().where("ts", ">=", since).get();
         kpis.logs24h = lSnap.size;
@@ -176,7 +229,7 @@ const modalActions = $("#modalActions");
 function openModal(title, bodyHTML, actions = []) {
     modalTitle.textContent = title;
     modalBody.innerHTML = bodyHTML;
-    modalActions.innerHTML = ""; // Limpiar acciones previas
+    modalActions.innerHTML = "";
     
     actions.forEach(a => {
         const btn = document.createElement("div");
@@ -199,7 +252,7 @@ const viewRoot = $("#viewRoot");
 const ROUTES = {
     dashboard: { title: "Dashboard", subtitle: "Resumen de envíos y actividad." },
     contacts: { title: "Contactos", subtitle: "Firestore" },
-    media: { title: "Media", subtitle: "Biblioteca de imágenes/videos (demo)." },
+    media: { title: "Media", subtitle: "Firebase Storage + Firestore" },
     campaigns: { title: "Campañas", subtitle: "Firestore" },
     calendar: { title: "Calendario", subtitle: "Programa campañas por fecha/hora." },
     history: { title: "Historial", subtitle: "Logs de envíos y respuestas simuladas." },
@@ -215,14 +268,13 @@ async function render() {
     // Activar Nav
     $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.route === currentRoute));
 
-    // Data local solo para demos (Media/Calendar/History)
-    const dbLocal = getDB();
+    const dbLocal = getDB(); // Solo para demos restantes (Calendar/History)
 
     switch (currentRoute) {
         case "dashboard": await renderDashboard(); break;
         case "contacts": await renderContactsFS(); break;
         case "campaigns": await renderCampaignsFS(); break; 
-        case "media": renderMedia(dbLocal); break;
+        case "media": await renderMediaFS(); break;
         case "calendar": renderCalendar(dbLocal); break;
         case "history": renderHistory(dbLocal); break;
         default: await renderDashboard();
@@ -322,6 +374,81 @@ function openContactModalFS(contact = null) {
     if (contact) $("#cStatus").value = contact.status || "active";
 }
 
+// --- MEDIA (New Implementation) ---
+async function renderMediaFS() {
+    const mediaList = await fsListMedia();
+    
+    // Grid de Media Items
+    const cards = mediaList.map(m => {
+        const preview = m.type === "video" 
+            ? `<video src="${m.url}" style="width:100%; height:120px; object-fit:cover; background:#000;" controls></video>` 
+            : `<img src="${m.url}" style="width:100%; height:120px; object-fit:cover; display:block; border-radius:4px;">`;
+            
+        return `
+        <div class="card" style="padding:10px; display:flex; flex-direction:column; gap:8px;">
+            ${preview}
+            <div>
+                <div style="font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHTML(m.alias)}</div>
+                <div class="tiny muted">${escapeHTML(m.type)} · ${(m.size / 1024).toFixed(1)} KB</div>
+            </div>
+            <button class="btn danger small" data-del="${m.id}" style="width:100%">Borrar</button>
+        </div>`;
+    }).join("");
+
+    viewRoot.innerHTML = `
+        <div class="row" style="justify-content:space-between">
+            <button class="btn" id="btnUploadMedia">Subir Media</button>
+            <div class="badge">${mediaList.length} archivos</div>
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap:12px; margin-top:12px;">
+            ${cards || '<div class="muted">No hay archivos multimedia.</div>'}
+        </div>`;
+
+    $("#btnUploadMedia").onclick = () => openUploadMediaModal();
+    $$("[data-del]").forEach(b => b.onclick = async () => {
+        if (confirm("¿Borrar archivo permanentemente?")) { await fsDeleteMedia(b.dataset.del); render(); }
+    });
+}
+
+function openUploadMediaModal() {
+    openModal("Subir Multimedia", `
+        <div class="field">
+            <label>Archivo (Imagen o Video)</label>
+            <input type="file" id="uFile" class="input" accept="image/*,video/*" />
+        </div>
+        <div class="field">
+            <label>Alias (Opcional)</label>
+            <input type="text" id="uAlias" class="input" placeholder="Ej: Promo Verano" />
+        </div>
+        <div id="uProgress" class="tiny muted" style="margin-top:5px; display:none;">Subiendo... espera por favor.</div>
+    `, [
+        { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
+        { key: "upload", html: `<button class="btn ok">Subir</button>`, onClick: async (e) => {
+            const fileInput = $("#uFile");
+            const file = fileInput.files[0];
+            const alias = $("#uAlias").value.trim();
+            
+            if (!file) return alert("Selecciona un archivo.");
+            
+            const btn = e.target;
+            btn.disabled = true;
+            btn.textContent = "Subiendo...";
+            $("#uProgress").style.display = "block";
+            
+            try {
+                await uploadMediaFile(file, alias);
+                modal.close();
+                render();
+            } catch (err) {
+                alert("Error al subir: " + err.message);
+                btn.disabled = false;
+                btn.textContent = "Subir";
+                $("#uProgress").style.display = "none";
+            }
+        }}
+    ]);
+}
+
 // --- CAMPAIGNS ---
 async function renderCampaignsFS() {
     const campaigns = await fsListCampaigns();
@@ -355,13 +482,15 @@ async function renderCampaignsFS() {
     });
 }
 
-function openCampaignModalFS(campaign = null) {
+async function openCampaignModalFS(campaign = null) {
     const isEdit = !!campaign;
-    // Helper para opciones de Media (Local Demo)
+    
+    // Cargar Media desde Firestore
+    const mediaList = await fsListMedia();
+    
     const mediaOpts = (selId) => {
-        const list = getDB().media || [];
         return `<option value="">(Sin media)</option>` + 
-               list.map(m => `<option value="${m.id}" ${selId === m.id ? "selected" : ""}>${escapeHTML(m.alias)}</option>`).join("");
+               mediaList.map(m => `<option value="${m.id}" ${selId === m.id ? "selected" : ""}>${m.type} · ${escapeHTML(m.alias)}</option>`).join("");
     };
 
     openModal(isEdit ? "Editar campaña" : "Nueva campaña", `
@@ -402,7 +531,6 @@ function openCampaignModalFS(campaign = null) {
 }
 
 // --- VISTAS DEMO (LocalStorage) ---
-function renderMedia(db) { viewRoot.innerHTML = `<div class="card">Media items: ${db.media.length} (Modo Demo)</div>`; }
 function renderCalendar(db) { viewRoot.innerHTML = `<div class="card">Calendario (Modo Demo)</div>`; }
 function renderHistory(db) { viewRoot.innerHTML = `<div class="card">Historial (Modo Demo)</div>`; }
 
@@ -412,12 +540,13 @@ function quickSendUI() {
 function quickSendAction() { alert("Simulación enviada a logs locales (Demo)."); }
 
 /* ==========================================================================
-   9. LocalStorage Helpers (Solo para Media/Demo)
+   9. LocalStorage Helpers (Solo para Calendar/History Demo)
    ========================================================================== */
 const DB_KEY = "wa_sender_db_v1";
 function getDB() {
     const raw = localStorage.getItem(DB_KEY);
-    return raw ? JSON.parse(raw) : { media: [], campaigns: [], schedules: [], logs: [], userStates: [], meta: { seeded: false } };
+    // Ya no incluimos "media" en el default
+    return raw ? JSON.parse(raw) : { campaigns: [], schedules: [], logs: [], userStates: [], meta: { seeded: false } };
 }
 function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
 function setDB(mutator) { const db = getDB(); mutator(db); saveDB(db); return db; }
