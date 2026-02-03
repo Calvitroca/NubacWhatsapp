@@ -16,16 +16,17 @@ const auth = firebase.auth();
 const dbFS = firebase.firestore(); // 👈 PÉGALO AQUÍ
 const provider = new firebase.auth.GoogleAuthProvider();
 
+async function fsListContacts() {
+  const snap = await contactsRef().orderBy("createdAt", "desc").get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
 function contactsRef() {
   const u = auth.currentUser;
   if (!u) throw new Error("No hay usuario logueado");
   return dbFS.collection("users").doc(u.uid).collection("contacts");
 }
 
-async function fsListContacts() {
-  const snap = await contactsRef().orderBy("createdAt", "desc").get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
 
 async function fsCreateContact(data) {
   const payload = {
@@ -351,7 +352,7 @@ function render() {
 
   const db = getDB();
   if (currentRoute === "dashboard") return renderDashboard(db);
-  if (currentRoute === "contacts") return renderContactsFS();
+  if (currentRoute === "contacts") return renderContacts(db); // puede ser async, ok
   if (currentRoute === "media") return renderMedia(db);
   if (currentRoute === "campaigns") return renderCampaigns(db);
   if (currentRoute === "calendar") return renderCalendar(db);
@@ -359,28 +360,56 @@ function render() {
   renderDashboard(db);
 }
 
-async function renderContactsFS() {
-  if (!requireLoginOrShowGate()) return;
-
+async function renderContacts(db) {
+  // 1) lee desde Firestore
   const contacts = await fsListContacts();
-  const db = getDB(); // sigues usando local para lo demás por ahora
-  db.contacts = contacts;
 
-  renderContacts(db);
+  // 2) pinta con el mismo HTML pero usando "contacts"
+  const rows = contacts.map((c) => `
+    <tr>
+      <td><b>${escapeHTML(c.name)}</b><div class="tiny muted">${escapeHTML(c.phone)}</div></td>
+      <td>${(c.tags || []).map((t) => `<span class="badge">${escapeHTML(t)}</span>`).join(" ")}</td>
+      <td>${escapeHTML(c.status || "active")}</td>
+      <td>
+        <button class="btn ghost" data-edit="${c.id}">Editar</button>
+        <button class="btn danger" data-del="${c.id}">Borrar</button>
+      </td>
+    </tr>
+  `).join("");
 
-  // Rewire acciones para que usen Firestore
-  $("#btnNewContact")?.addEventListener("click", () => openContactModalFS(null));
-  $("#btnImportCSV")?.addEventListener("click", () => importCSVModalFS());
+  viewRoot.innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <button class="btn" id="btnNewContact">Nuevo contacto</button>
+        <button class="btn ghost" id="btnImportCSV">Importar CSV (demo)</button>
+      </div>
+      <div class="badge">${contacts.length} contactos</div>
+    </div>
+    <div style="height:12px"></div>
+    <div class="card">
+      <table class="table">
+        <thead>
+          <tr><th>Contacto</th><th>Tags</th><th>Estado</th><th>Acciones</th></tr>
+        </thead>
+        <tbody>${rows || `<tr><td colspan="4">Sin contactos.</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
 
-  $$("[data-edit]").forEach((b) => b.addEventListener("click", () => {
+  // botones
+  $("#btnNewContact")?.addEventListener("click", () => openContactModal());
+  $("#btnImportCSV")?.addEventListener("click", () => importCSVModal());
+
+  $$("[data-edit]").forEach((b) => b.addEventListener("click", async () => {
     const id = b.getAttribute("data-edit");
+    // buscamos el contacto en la lista actual
     const c = contacts.find((x) => x.id === id);
-    if (c) openContactModalFS(c);
+    if (c) openContactModal(c);
   }));
 
   $$("[data-del]").forEach((b) => b.addEventListener("click", async () => {
     const id = b.getAttribute("data-del");
-    await fsDeleteContact(id);
+    await contactsRef().doc(id).delete();
     render(); // refresca vista
   }));
 }
@@ -461,55 +490,6 @@ function quickSendUI(db) {
     </div>
   `;
 }
-
-function renderContacts(db) {
-  const rows = db.contacts.map((c) => `
-    <tr>
-      <td><b>${escapeHTML(c.name)}</b><div class="tiny muted">${escapeHTML(c.phone)}</div></td>
-      <td>${c.tags.map((t) => `<span class="badge">${escapeHTML(t)}</span>`).join(" ")}</td>
-      <td>${escapeHTML(c.status)}</td>
-      <td>
-        <button class="btn ghost" data-edit="${c.id}">Editar</button>
-        <button class="btn danger" data-del="${c.id}">Borrar</button>
-      </td>
-    </tr>
-  `).join("");
-
-  viewRoot.innerHTML = `
-    <div class="row" style="justify-content:space-between">
-      <div class="row">
-        <button class="btn" id="btnNewContact">Nuevo contacto</button>
-        <button class="btn ghost" id="btnImportCSV">Importar CSV (demo)</button>
-      </div>
-      <div class="badge">${db.contacts.length} contactos</div>
-    </div>
-    <div style="height:12px"></div>
-    <div class="card">
-      <table class="table">
-        <thead>
-          <tr><th>Contacto</th><th>Tags</th><th>Estado</th><th>Acciones</th></tr>
-        </thead>
-        <tbody>${rows || `<tr><td colspan="4">Sin contactos. Carga demo.</td></tr>`}</tbody>
-      </table>
-    </div>
-  `;
-
-  $("#btnNewContact")?.addEventListener("click", () => openContactModal());
-  $("#btnImportCSV")?.addEventListener("click", () => importCSVModal());
-
-  $$("[data-edit]").forEach((b) => b.addEventListener("click", () => {
-    const id = b.getAttribute("data-edit");
-    const c = db.contacts.find((x) => x.id === id);
-    if (c) openContactModal(c);
-  }));
-
-  $$("[data-del]").forEach((b) => b.addEventListener("click", () => {
-    const id = b.getAttribute("data-del");
-    setDB((db2) => { db2.contacts = db2.contacts.filter((x) => x.id !== id); });
-    render();
-  }));
-}
-
 function openContactModalFS(contact = null) {
   const isEdit = !!contact;
 
