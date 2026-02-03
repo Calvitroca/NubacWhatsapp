@@ -1,3 +1,4 @@
+
 // ===== Auth + API config =====
 const API_BASE = localStorage.getItem("API_BASE") || ""; // ej: https://app-xxxxx-uc.a.run.app
 
@@ -13,6 +14,7 @@ const firebaseConfig = {
 
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
+const dbFS = firebase.firestore(); // 👈 PÉGALO AQUÍ
 const provider = new firebase.auth.GoogleAuthProvider();
 
 let currentIdToken = null;

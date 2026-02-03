@@ -13,6 +13,7 @@ const firebaseConfig = {
 
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
+const dbFS = firebase.firestore(); // 👈 PÉGALO AQUÍ
 const provider = new firebase.auth.GoogleAuthProvider();
 
 let currentIdToken = null;
