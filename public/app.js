@@ -35,8 +35,10 @@ const schedulesRef = () => userDocRef().collection("schedules");
 const logsRef = () => userDocRef().collection("logs");
 
 /* ==========================================================================
-   3. Firestore Data Helpers (CRUD y KPIs)
+   3. Firestore Data Helpers (CRUD Contacts & Campaigns)
    ========================================================================== */
+
+// --- CONTACTS ---
 async function fsListContacts() {
     const snap = await contactsRef().orderBy("createdAt", "desc").get();
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -63,6 +65,34 @@ async function fsDeleteContact(id) {
     return await contactsRef().doc(id).delete();
 }
 
+// --- CAMPAIGNS ---
+async function fsListCampaigns() {
+    const snap = await campaignsRef().orderBy("createdAt", "desc").get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function fsCreateCampaign(data) {
+    const payload = {
+        ...data,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+    return await campaignsRef().add(payload);
+}
+
+async function fsUpdateCampaign(id, data) {
+    const payload = {
+        ...data,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+    return await campaignsRef().doc(id).set(payload, { merge: true });
+}
+
+async function fsDeleteCampaign(id) {
+    return await campaignsRef().doc(id).delete();
+}
+
+// --- KPI DASHBOARD ---
 async function getDashboardKPIsFS() {
     const kpis = { totalContacts: 0, totalCampaigns: 0, scheduledPending: 0, logs24h: 0 };
     try {
@@ -76,6 +106,7 @@ async function getDashboardKPIsFS() {
         kpis.totalCampaigns = cmpSnap.size;
         kpis.scheduledPending = schSnap.size;
 
+        // Logs 24h (Asumiendo campo ts ISO string por ahora)
         const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
         const lSnap = await logsRef().where("ts", ">=", since).get();
         kpis.logs24h = lSnap.size;
@@ -134,9 +165,6 @@ function escapeAttr(s) {
     return escapeHTML(s).replace(/\n/g, " ");
 }
 
-function nowISO() { return new Date().toISOString(); }
-function uid(p = "id") { return `${p}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`; }
-
 /* ==========================================================================
    6. Modal System
    ========================================================================== */
@@ -172,7 +200,7 @@ const ROUTES = {
     dashboard: { title: "Dashboard", subtitle: "Resumen de envíos y actividad." },
     contacts: { title: "Contactos", subtitle: "Firestore" },
     media: { title: "Media", subtitle: "Biblioteca de imágenes/videos (demo)." },
-    campaigns: { title: "Campañas", subtitle: "Editor de mensajes dinámicos." },
+    campaigns: { title: "Campañas", subtitle: "Firestore" },
     calendar: { title: "Calendario", subtitle: "Programa campañas por fecha/hora." },
     history: { title: "Historial", subtitle: "Logs de envíos y respuestas simuladas." },
 };
@@ -187,13 +215,14 @@ async function render() {
     // Activar Nav
     $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.route === currentRoute));
 
+    // Data local solo para demos (Media/Calendar/History)
     const dbLocal = getDB();
 
     switch (currentRoute) {
         case "dashboard": await renderDashboard(); break;
         case "contacts": await renderContactsFS(); break;
+        case "campaigns": await renderCampaignsFS(); break; 
         case "media": renderMedia(dbLocal); break;
-        case "campaigns": renderCampaigns(dbLocal); break;
         case "calendar": renderCalendar(dbLocal); break;
         case "history": renderHistory(dbLocal); break;
         default: await renderDashboard();
@@ -209,6 +238,7 @@ function navigate(route) {
    8. Implementación de Vistas
    ========================================================================== */
 
+// --- DASHBOARD ---
 async function renderDashboard() {
     const kpi = await getDashboardKPIsFS();
     viewRoot.innerHTML = `
@@ -228,12 +258,13 @@ async function renderDashboard() {
             </div>
             <div class="card">
                 <b>Atajo: Enviar ahora</b><hr/>
-                ${quickSendUI(getDB())}
+                ${quickSendUI()}
             </div>
         </div>`;
     $("#qsSend")?.addEventListener("click", () => quickSendAction());
 }
 
+// --- CONTACTS ---
 async function renderContactsFS() {
     const contacts = await fsListContacts();
     const rows = contacts.map(c => `
@@ -291,19 +322,97 @@ function openContactModalFS(contact = null) {
     if (contact) $("#cStatus").value = contact.status || "active";
 }
 
-// Vistas Demo (LocalStorage)
+// --- CAMPAIGNS ---
+async function renderCampaignsFS() {
+    const campaigns = await fsListCampaigns();
+    const rows = campaigns.map(c => `
+        <tr>
+            <td><b>${escapeHTML(c.title)}</b></td>
+            <td class="muted">${escapeHTML(c.teaserText).substring(0, 30)}...</td>
+            <td class="muted">${escapeHTML(c.detailText).substring(0, 30)}...</td>
+            <td>
+                <button class="btn ghost" data-edit="${c.id}">Editar</button>
+                <button class="btn danger" data-del="${c.id}">Borrar</button>
+            </td>
+        </tr>`).join("");
+
+    viewRoot.innerHTML = `
+        <div class="row" style="justify-content:space-between">
+            <button class="btn" id="btnNewCampaign">Nueva campaña</button>
+            <div class="badge">${campaigns.length} campañas</div>
+        </div>
+        <div class="card" style="margin-top:12px">
+            <table class="table">
+                <thead><tr><th>Título</th><th>Teaser</th><th>Detalle</th><th>Acciones</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="4">Sin campañas.</td></tr>'}</tbody>
+            </table>
+        </div>`;
+
+    $("#btnNewCampaign").onclick = () => openCampaignModalFS();
+    $$("[data-edit]").forEach(b => b.onclick = () => openCampaignModalFS(campaigns.find(x => x.id === b.dataset.edit)));
+    $$("[data-del]").forEach(b => b.onclick = async () => {
+        if (confirm("¿Eliminar campaña?")) { await fsDeleteCampaign(b.dataset.del); render(); }
+    });
+}
+
+function openCampaignModalFS(campaign = null) {
+    const isEdit = !!campaign;
+    // Helper para opciones de Media (Local Demo)
+    const mediaOpts = (selId) => {
+        const list = getDB().media || [];
+        return `<option value="">(Sin media)</option>` + 
+               list.map(m => `<option value="${m.id}" ${selId === m.id ? "selected" : ""}>${escapeHTML(m.alias)}</option>`).join("");
+    };
+
+    openModal(isEdit ? "Editar campaña" : "Nueva campaña", `
+        <div class="field"><label>Título Interno</label><input class="input" id="cmpTitle" value="${campaign ? escapeAttr(campaign.title) : ""}" /></div>
+        <hr/>
+        <div class="field"><label>Teaser Text (Mensaje inicial)</label><textarea class="input" id="cmpTeaser">${campaign ? escapeHTML(campaign.teaserText) : ""}</textarea></div>
+        <div class="field"><label>Teaser Media (Img/Video)</label><select class="input" id="cmpTeaserMedia">${mediaOpts(campaign?.teaserMediaId)}</select></div>
+        <hr/>
+        <div class="field"><label>Detail Text (Respuesta a botón)</label><textarea class="input" id="cmpDetail">${campaign ? escapeHTML(campaign.detailText) : ""}</textarea></div>
+        <div class="field"><label>Detail Media (Opcional)</label><select class="input" id="cmpDetailMedia">${mediaOpts(campaign?.detailMediaId)}</select></div>
+        <hr/>
+        <div class="grid cols2">
+            <div class="field"><label>Reject Text</label><input class="input" id="cmpReject" value="${campaign ? escapeAttr(campaign.rejectText) : "Entendido, no enviaremos más."}" /></div>
+            <div class="field"><label>Error Text</label><input class="input" id="cmpError" value="${campaign ? escapeAttr(campaign.errorText) : "Ocurrió un error."}" /></div>
+        </div>
+    `, [
+        { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
+        { key: "save", html: `<button class="btn ok">${isEdit ? "Guardar" : "Crear"}</button>`, onClick: async () => {
+            const data = {
+                title: $("#cmpTitle").value.trim(),
+                teaserText: $("#cmpTeaser").value.trim(),
+                teaserMediaId: $("#cmpTeaserMedia").value || null,
+                detailText: $("#cmpDetail").value.trim(),
+                detailMediaId: $("#cmpDetailMedia").value || null,
+                rejectText: $("#cmpReject").value.trim(),
+                errorText: $("#cmpError").value.trim()
+            };
+
+            if (!data.title || !data.teaserText || !data.detailText) {
+                return alert("Título, Teaser y Detalle son obligatorios.");
+            }
+
+            isEdit ? await fsUpdateCampaign(campaign.id, data) : await fsCreateCampaign(data);
+            modal.close();
+            render();
+        }}
+    ]);
+}
+
+// --- VISTAS DEMO (LocalStorage) ---
 function renderMedia(db) { viewRoot.innerHTML = `<div class="card">Media items: ${db.media.length} (Modo Demo)</div>`; }
-function renderCampaigns(db) { viewRoot.innerHTML = `<div class="card">Campañas: ${db.campaigns.length} (Modo Demo)</div>`; }
 function renderCalendar(db) { viewRoot.innerHTML = `<div class="card">Calendario (Modo Demo)</div>`; }
 function renderHistory(db) { viewRoot.innerHTML = `<div class="card">Historial (Modo Demo)</div>`; }
 
-function quickSendUI(db) {
+function quickSendUI() {
     return `<button class="btn ok" id="qsSend">Simular Envío Masivo</button>`;
 }
-function quickSendAction() { alert("Simulación enviada a logs locales."); }
+function quickSendAction() { alert("Simulación enviada a logs locales (Demo)."); }
 
 /* ==========================================================================
-   9. LocalStorage Helpers (Solo Demo)
+   9. LocalStorage Helpers (Solo para Media/Demo)
    ========================================================================== */
 const DB_KEY = "wa_sender_db_v1";
 function getDB() {
