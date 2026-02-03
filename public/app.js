@@ -16,6 +16,12 @@ const auth = firebase.auth();
 const dbFS = firebase.firestore(); // 👈 PÉGALO AQUÍ
 const provider = new firebase.auth.GoogleAuthProvider();
 
+function contactsRef() {
+  const u = auth.currentUser;
+  if (!u) throw new Error("No hay usuario logueado");
+  return dbFS.collection("users").doc(u.uid).collection("contacts");
+}
+
 let currentIdToken = null;
 
 async function getIdToken() {
