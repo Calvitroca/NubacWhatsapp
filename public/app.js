@@ -397,14 +397,14 @@ async function renderContacts(db) {
   `;
 
   // botones
-  $("#btnNewContact")?.addEventListener("click", () => openContactModal());
+  $("#btnNewContact")?.addEventListener("click", () => openContactModalFS());
   $("#btnImportCSV")?.addEventListener("click", () => importCSVModal());
 
   $$("[data-edit]").forEach((b) => b.addEventListener("click", async () => {
     const id = b.getAttribute("data-edit");
     // buscamos el contacto en la lista actual
     const c = contacts.find((x) => x.id === id);
-    if (c) openContactModal(c);
+    if (c) openContactModalFS(c);
   }));
 
   $$("[data-del]").forEach((b) => b.addEventListener("click", async () => {
@@ -491,7 +491,9 @@ function quickSendUI(db) {
   `;
 }
 function openContactModalFS(contact = null) {
-  const isEdit = !!contact;
+  const isEdit = !!contact; 
+  // Alias para no romper los handlers existentes
+  const openContactModal = openContactModalFS;
 
   openModal(
     isEdit ? "Editar contacto" : "Nuevo contacto",
