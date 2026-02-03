@@ -37,10 +37,14 @@
         <div>
           <h1 id="viewTitle">Dashboard</h1>
           <p class="muted" id="viewSubtitle">Resumen de envíos y actividad.</p>
+          <p class="tiny muted" id="authStatus"></p>
         </div>
-        <div class="topbar-actions">
-          <button class="btn" id="btnSeedDemo">Cargar demo</button>
-        </div>
+          <div class="topbar-actions">
+            <button class="btn ghost" id="btnLogin" type="button">Entrar con Google</button>
+            <button class="btn ghost" id="btnLogout" type="button" style="display:none;">Salir</button>
+
+            <button class="btn" id="btnSeedDemo">Cargar demo</button>
+          </div>
       </header>
 
       <section id="viewRoot" class="view"></section>
@@ -58,6 +62,8 @@
     </form>
   </dialog>
 
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>

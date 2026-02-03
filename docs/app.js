@@ -1,3 +1,77 @@
+// ===== Auth + API config =====
+const API_BASE = localStorage.getItem("API_BASE") || ""; // ej: https://app-xxxxx-uc.a.run.app
+
+const firebaseConfig = {
+    apiKey: "AIzaSyD2ZNznq-2l9hMahVzyT9XwOI2hZjzz7gU",
+    authDomain: "nubacwhatsapp.firebaseapp.com",
+    projectId: "nubacwhatsapp",
+    storageBucket: "nubacwhatsapp.firebasestorage.app",
+    messagingSenderId: "378836642199",
+    appId: "1:378836642199:web:34241484eb04c75137fcd2",
+    measurementId: "G-5096DDYHL2"
+  };
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const provider = new firebase.auth.GoogleAuthProvider();
+
+let currentIdToken = null;
+
+async function getIdToken() {
+  const u = auth.currentUser;
+  if (!u) return null;
+  currentIdToken = await u.getIdToken(false);
+  return currentIdToken;
+}
+
+function setAuthUI(user) {
+  const st = document.getElementById("authStatus");
+  const btnLogin = document.getElementById("btnLogin");
+  const btnLogout = document.getElementById("btnLogout");
+  if (!st || !btnLogin || !btnLogout) return;
+
+  if (user) {
+    st.textContent = `Sesión: ${user.displayName || user.email}`;
+    btnLogin.style.display = "none";
+    btnLogout.style.display = "inline-flex";
+  } else {
+    st.textContent = "Sesión: (no iniciada)";
+    btnLogin.style.display = "inline-flex";
+    btnLogout.style.display = "none";
+  }
+}
+
+document.getElementById("btnLogin")?.addEventListener("click", async () => {
+  await auth.signInWithPopup(provider);
+});
+
+document.getElementById("btnLogout")?.addEventListener("click", async () => {
+  await auth.signOut();
+});
+
+auth.onAuthStateChanged(async (user) => {
+  setAuthUI(user);
+  await getIdToken();
+  render(); // re-render cuando cambia sesión
+});
+
+function requireLoginOrShowGate() {
+  if (auth.currentUser) return true;
+
+  viewRoot.innerHTML = `
+    <div class="card">
+      <div style="font-weight:900">Inicia sesión para continuar</div>
+      <div class="muted">Este sistema usa Google Auth. El backend valida tu token.</div>
+      <hr />
+      <button class="btn ok" id="btnGateLogin">Entrar con Google</button>
+    </div>
+  `;
+  document.getElementById("btnGateLogin")?.addEventListener("click", async () => {
+    await auth.signInWithPopup(provider);
+  });
+
+  return false;
+}
 /* WhatsApp Sender — Demo SPA (LocalStorage) */
 
 const DB_KEY = "wa_sender_db_v1";
@@ -29,6 +103,32 @@ function nowISO() {
 
 function uid(prefix = "id") {
   return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now().toString(16)}`;
+}
+function apiUrl(path) {
+  if (!API_BASE) throw new Error("API_BASE no configurado (localStorage)");
+  return API_BASE.replace(/\/$/, "") + path;
+}
+
+async function apiFetch(path, opts = {}) {
+  const token = await getIdToken();
+  if (!token) throw new Error("No hay sesión (token null)");
+
+  const headers = {
+    "Content-Type": "application/json",
+    ...(opts.headers || {}),
+    Authorization: `Bearer ${token}`,
+  };
+
+  const res = await fetch(apiUrl(path), { ...opts, headers });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+
+  if (!res.ok) {
+    const msg = (data && data.error) ? data.error : `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  return data;
 }
 
 /* ---------------- DB ---------------- */
@@ -212,6 +312,8 @@ function navigate(route) {
 }
 
 function render() {
+  if (!requireLoginOrShowGate()) return;
+
   const db = getDB();
   if (currentRoute === "dashboard") return renderDashboard(db);
   if (currentRoute === "contacts") return renderContacts(db);
