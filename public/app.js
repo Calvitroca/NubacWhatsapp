@@ -37,7 +37,7 @@ const logsRef = () => userDocRef().collection("logs");
 const mediaRef = () => userDocRef().collection("media");
 
 /* ==========================================================================
-   3. Firestore Data Helpers (CRUD Contacts, Campaigns & Media)
+   3. Firestore Data Helpers (CRUD Contacts, Campaigns, Media & Schedules)
    ========================================================================== */
 
 // --- CONTACTS ---
@@ -92,6 +92,39 @@ async function fsUpdateCampaign(id, data) {
 
 async function fsDeleteCampaign(id) {
     return await campaignsRef().doc(id).delete();
+}
+
+// --- SCHEDULES (Programación) ---
+async function fsListSchedules() {
+    // Ordenar por fecha de programación ascendente (próximos eventos primero)
+    const snap = await schedulesRef().orderBy("scheduledAt", "asc").get();
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function fsCreateSchedule(data) {
+    const payload = {
+        ...data,
+        status: data.status || "pending",
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+    return await schedulesRef().add(payload);
+}
+
+async function fsUpdateSchedule(id, data) {
+    const payload = {
+        ...data,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    };
+    return await schedulesRef().doc(id).set(payload, { merge: true });
+}
+
+async function fsCancelSchedule(id) {
+    return await fsUpdateSchedule(id, { status: "cancelled" });
+}
+
+async function fsDeleteSchedule(id) {
+    return await schedulesRef().doc(id).delete();
 }
 
 // --- MEDIA (Firestore + Storage) ---
@@ -254,7 +287,7 @@ const ROUTES = {
     contacts: { title: "Contactos", subtitle: "Firestore" },
     media: { title: "Media", subtitle: "Firebase Storage + Firestore" },
     campaigns: { title: "Campañas", subtitle: "Firestore" },
-    calendar: { title: "Calendario", subtitle: "Programa campañas por fecha/hora." },
+    calendar: { title: "Calendario", subtitle: "Programación de envíos (Firestore)" },
     history: { title: "Historial", subtitle: "Logs de envíos y respuestas simuladas." },
 };
 
@@ -268,14 +301,14 @@ async function render() {
     // Activar Nav
     $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.route === currentRoute));
 
-    const dbLocal = getDB(); // Solo para demos restantes (Calendar/History)
+    const dbLocal = getDB(); // Solo para demos restantes (History)
 
     switch (currentRoute) {
         case "dashboard": await renderDashboard(); break;
         case "contacts": await renderContactsFS(); break;
         case "campaigns": await renderCampaignsFS(); break; 
         case "media": await renderMediaFS(); break;
-        case "calendar": renderCalendar(dbLocal); break;
+        case "calendar": await renderCalendarFS(); break;
         case "history": renderHistory(dbLocal); break;
         default: await renderDashboard();
     }
@@ -374,7 +407,7 @@ function openContactModalFS(contact = null) {
     if (contact) $("#cStatus").value = contact.status || "active";
 }
 
-// --- MEDIA (New Implementation) ---
+// --- MEDIA ---
 async function renderMediaFS() {
     const mediaList = await fsListMedia();
     
@@ -530,9 +563,128 @@ async function openCampaignModalFS(campaign = null) {
     ]);
 }
 
-// --- VISTAS DEMO (LocalStorage) ---
-function renderCalendar(db) { viewRoot.innerHTML = `<div class="card">Calendario (Modo Demo)</div>`; }
-function renderHistory(db) { viewRoot.innerHTML = `<div class="card">Historial (Modo Demo)</div>`; }
+// --- CALENDAR (Schedules) ---
+async function renderCalendarFS() {
+    const schedules = await fsListSchedules();
+    
+    const rows = schedules.map(s => {
+        // Formatear fecha
+        const dateStr = s.scheduledAt ? s.scheduledAt.toDate().toLocaleString() : "Sin fecha";
+        
+        // Formatear audiencia
+        let audienceStr = "-";
+        if (s.target?.type === "all") audienceStr = "Todos";
+        else if (s.target?.type === "tags") audienceStr = `Tags: ${(s.target.tags || []).join(", ")}`;
+        else if (s.target?.type === "contacts") audienceStr = `${(s.target.contactIds || []).length} contactos`;
+
+        // Botones de acción
+        let actionsHtml = `<button class="btn danger small" data-del="${s.id}">Borrar</button>`;
+        if (s.status === "pending") {
+            actionsHtml = `<button class="btn ghost small" data-cancel="${s.id}">Cancelar</button> ` + actionsHtml;
+        }
+
+        return `
+        <tr>
+            <td><b>${escapeHTML(s.campaignTitle)}</b></td>
+            <td>${dateStr}</td>
+            <td>${escapeHTML(audienceStr)}</td>
+            <td><span class="badge ${s.status === 'pending' ? '' : 'muted'}">${escapeHTML(s.status)}</span></td>
+            <td>${actionsHtml}</td>
+        </tr>`;
+    }).join("");
+
+    viewRoot.innerHTML = `
+        <div class="row" style="justify-content:space-between">
+            <button class="btn" id="btnNewSchedule">Programar campaña</button>
+            <div class="badge">${schedules.length} programadas</div>
+        </div>
+        <div class="card" style="margin-top:12px">
+            <table class="table">
+                <thead><tr><th>Campaña</th><th>Fecha/Hora</th><th>Audiencia</th><th>Status</th><th>Acciones</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="5">No hay envíos programados.</td></tr>'}</tbody>
+            </table>
+        </div>`;
+
+    $("#btnNewSchedule").onclick = () => openScheduleModal();
+    
+    $$("[data-cancel]").forEach(b => b.onclick = async () => {
+        if (confirm("¿Cancelar este envío?")) { await fsCancelSchedule(b.dataset.cancel); render(); }
+    });
+    
+    $$("[data-del]").forEach(b => b.onclick = async () => {
+        if (confirm("¿Borrar registro?")) { await fsDeleteSchedule(b.dataset.del); render(); }
+    });
+}
+
+async function openScheduleModal() {
+    const campaigns = await fsListCampaigns();
+    if (campaigns.length === 0) return alert("Primero crea una campaña.");
+
+    const campOptions = campaigns.map(c => `<option value="${c.id}">${escapeHTML(c.title)}</option>`).join("");
+
+    openModal("Programar Envío", `
+        <div class="field">
+            <label>Campaña</label>
+            <select class="input" id="sCampId">${campOptions}</select>
+        </div>
+        <div class="field">
+            <label>Fecha y Hora</label>
+            <input type="datetime-local" class="input" id="sDate" />
+        </div>
+        <div class="field">
+            <label>Audiencia</label>
+            <select class="input" id="sType">
+                <option value="all">Todos los contactos</option>
+                <option value="tags">Por etiquetas (tags)</option>
+            </select>
+        </div>
+        <div class="field" id="divTags" style="display:none">
+            <label>Tags (separados por coma)</label>
+            <input class="input" id="sTags" placeholder="vip, promo, etc" />
+        </div>
+    `, [
+        { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
+        { key: "save", html: `<button class="btn ok">Guardar</button>`, onClick: async () => {
+            const campId = $("#sCampId").value;
+            const dateVal = $("#sDate").value;
+            const typeVal = $("#sType").value;
+            const tagsVal = $("#sTags").value;
+
+            if (!campId || !dateVal) return alert("Campaña y Fecha requeridas.");
+
+            const selectedCamp = campaigns.find(c => c.id === campId);
+            const target = { type: typeVal };
+            
+            if (typeVal === "tags") {
+                const tagsList = tagsVal.split(",").map(t => t.trim()).filter(Boolean);
+                if (tagsList.length === 0) return alert("Ingresa al menos un tag.");
+                target.tags = tagsList;
+            }
+
+            const data = {
+                campaignId: campId,
+                campaignTitle: selectedCamp ? selectedCamp.title : "Sin título",
+                target: target,
+                scheduledAt: firebase.firestore.Timestamp.fromDate(new Date(dateVal)),
+                status: "pending"
+            };
+
+            await fsCreateSchedule(data);
+            modal.close();
+            render();
+        }}
+    ]);
+
+    // Toggle Tags input
+    const typeSel = document.getElementById("sType");
+    const divTags = document.getElementById("divTags");
+    typeSel.addEventListener("change", () => {
+        divTags.style.display = typeSel.value === "tags" ? "block" : "none";
+    });
+}
+
+// --- VISTAS DEMO RESTANTES (History) ---
+function renderHistory(db) { viewRoot.innerHTML = `<div class="card">Historial (Modo Demo Local)</div>`; }
 
 function quickSendUI() {
     return `<button class="btn ok" id="qsSend">Simular Envío Masivo</button>`;
@@ -540,16 +692,14 @@ function quickSendUI() {
 function quickSendAction() { alert("Simulación enviada a logs locales (Demo)."); }
 
 /* ==========================================================================
-   9. LocalStorage Helpers (Solo para Calendar/History Demo)
+   9. LocalStorage Helpers (Solo para History Demo)
    ========================================================================== */
 const DB_KEY = "wa_sender_db_v1";
 function getDB() {
     const raw = localStorage.getItem(DB_KEY);
-    // Ya no incluimos "media" en el default
     return raw ? JSON.parse(raw) : { campaigns: [], schedules: [], logs: [], userStates: [], meta: { seeded: false } };
 }
 function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
-function setDB(mutator) { const db = getDB(); mutator(db); saveDB(db); return db; }
 
 /* ==========================================================================
    10. Boot / Inicialización
