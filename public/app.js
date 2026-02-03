@@ -518,7 +518,10 @@ function openContactModalFS(contact = null) {
     `,
     [
       { key: "cancel", html: `<button class="btn ghost" data-action="cancel" value="cancel">Cancelar</button>`, onClick: () => modal.close() },
-      { key: "save", html: `<button class="btn ok" data-action="save" value="default">${isEdit ? "Guardar" : "Crear"}</button>`, onClick: async () => {
+      { 
+        key: "save",
+        html: `<button class="btn ok" data-action="save" value="default">${isEdit ? "Guardar" : "Crear"}</button>`,
+        onClick: async () => {
           const name = $("#cName").value.trim();
           const phone = $("#cPhone").value.trim();
           const tags = $("#cTags").value.split(",").map(t => t.trim()).filter(Boolean);
@@ -526,15 +529,29 @@ function openContactModalFS(contact = null) {
 
           if (!name || !phone) return alert("Nombre y teléfono son obligatorios.");
 
-          if (isEdit) {
-            await fsUpdateContact(contact.id, { name, phone, tags, status });
-          } else {
-            await fsCreateContact({ name, phone, tags, status });
-          }
+          const payload = {
+            name,
+            phone,
+            tags,
+            status,
+            createdAt: isEdit ? (contact.createdAt || nowISO()) : nowISO(),
+            updatedAt: nowISO(),
+          };
 
-          modal.close();
-          render();
-        } 
+          try {
+            if (isEdit) {
+              await contactsRef().doc(contact.id).set(payload, { merge: true });
+            } else {
+              await contactsRef().add(payload);
+            }
+
+            modal.close();
+            render();
+          } catch (err) {
+            console.error(err);
+            alert("Error guardando en Firestore: " + (err.message || err));
+          }
+        }
       },
     ]
   );
