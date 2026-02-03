@@ -22,6 +22,34 @@ function contactsRef() {
   return dbFS.collection("users").doc(u.uid).collection("contacts");
 }
 
+async function fsListContacts() {
+  const snap = await contactsRef().orderBy("createdAt", "desc").get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function fsCreateContact(data) {
+  const payload = {
+    name: data.name,
+    phone: data.phone,
+    tags: data.tags || [],
+    status: data.status || "active",
+    createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+  };
+  const ref = await contactsRef().add(payload);
+  return ref.id;
+}
+
+async function fsUpdateContact(id, patch) {
+  await contactsRef().doc(id).set({
+    ...patch,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+}
+
+async function fsDeleteContact(id) {
+  await contactsRef().doc(id).delete();
+}
+
 let currentIdToken = null;
 
 async function getIdToken() {
@@ -323,12 +351,38 @@ function render() {
 
   const db = getDB();
   if (currentRoute === "dashboard") return renderDashboard(db);
-  if (currentRoute === "contacts") return renderContacts(db);
+  if (currentRoute === "contacts") return renderContactsFS();
   if (currentRoute === "media") return renderMedia(db);
   if (currentRoute === "campaigns") return renderCampaigns(db);
   if (currentRoute === "calendar") return renderCalendar(db);
   if (currentRoute === "history") return renderHistory(db);
   renderDashboard(db);
+}
+
+async function renderContactsFS() {
+  if (!requireLoginOrShowGate()) return;
+
+  const contacts = await fsListContacts();
+  const db = getDB(); // sigues usando local para lo demás por ahora
+  db.contacts = contacts;
+
+  renderContacts(db);
+
+  // Rewire acciones para que usen Firestore
+  $("#btnNewContact")?.addEventListener("click", () => openContactModalFS(null));
+  $("#btnImportCSV")?.addEventListener("click", () => importCSVModalFS());
+
+  $$("[data-edit]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.getAttribute("data-edit");
+    const c = contacts.find((x) => x.id === id);
+    if (c) openContactModalFS(c);
+  }));
+
+  $$("[data-del]").forEach((b) => b.addEventListener("click", async () => {
+    const id = b.getAttribute("data-del");
+    await fsDeleteContact(id);
+    render(); // refresca vista
+  }));
 }
 
 /* ---------------- Views ---------------- */
@@ -456,8 +510,9 @@ function renderContacts(db) {
   }));
 }
 
-function openContactModal(contact = null) {
+function openContactModalFS(contact = null) {
   const isEdit = !!contact;
+
   openModal(
     isEdit ? "Editar contacto" : "Nuevo contacto",
     `
@@ -471,7 +526,7 @@ function openContactModal(contact = null) {
       </div>
       <div class="field">
         <label>Tags (separados por coma)</label>
-        <input class="input" id="cTags" placeholder="clientes,felicat" value="${contact ? escapeAttr(contact.tags.join(",")) : ""}" />
+        <input class="input" id="cTags" placeholder="clientes,felicat" value="${contact ? escapeAttr((contact.tags || []).join(",")) : ""}" />
       </div>
       <div class="field">
         <label>Estado</label>
@@ -483,7 +538,7 @@ function openContactModal(contact = null) {
     `,
     [
       { key: "cancel", html: `<button class="btn ghost" data-action="cancel" value="cancel">Cancelar</button>`, onClick: () => modal.close() },
-      { key: "save", html: `<button class="btn ok" data-action="save" value="default">${isEdit ? "Guardar" : "Crear"}</button>`, onClick: () => {
+      { key: "save", html: `<button class="btn ok" data-action="save" value="default">${isEdit ? "Guardar" : "Crear"}</button>`, onClick: async () => {
           const name = $("#cName").value.trim();
           const phone = $("#cPhone").value.trim();
           const tags = $("#cTags").value.split(",").map(t => t.trim()).filter(Boolean);
@@ -491,14 +546,11 @@ function openContactModal(contact = null) {
 
           if (!name || !phone) return alert("Nombre y teléfono son obligatorios.");
 
-          setDB((db) => {
-            if (isEdit) {
-              const idx = db.contacts.findIndex((x) => x.id === contact.id);
-              db.contacts[idx] = { ...db.contacts[idx], name, phone, tags, status };
-            } else {
-              db.contacts.push({ id: uid("ct"), name, phone, tags, status, createdAt: nowISO() });
-            }
-          });
+          if (isEdit) {
+            await fsUpdateContact(contact.id, { name, phone, tags, status });
+          } else {
+            await fsCreateContact({ name, phone, tags, status });
+          }
 
           modal.close();
           render();
@@ -507,32 +559,28 @@ function openContactModal(contact = null) {
     ]
   );
 
-  if (contact) $("#cStatus").value = contact.status;
+  if (contact) $("#cStatus").value = contact.status || "active";
 }
 
-function importCSVModal() {
+function importCSVModalFS() {
   openModal(
     "Importar CSV (demo)",
     `
-      <div class="muted">Para la versión escolar basta con simular importación. Este botón creará 5 contactos extra.</div>
+      <div class="muted">Esto creará 5 contactos extra (Firestore).</div>
       <hr />
       <div class="tiny muted">Formato típico: name,phone,tags</div>
     `,
     [
       { key: "cancel", html: `<button class="btn ghost" data-action="cancel" value="cancel">Cerrar</button>`, onClick: () => modal.close() },
-      { key: "do", html: `<button class="btn ok" data-action="do" value="default">Importar (simular)</button>`, onClick: () => {
-          setDB((db) => {
-            for (let i=0;i<5;i++){
-              db.contacts.push({
-                id: uid("ct"),
-                name: `Importado ${i+1}`,
-                phone: `+5213311111${String(20+i)}`,
-                tags: ["auditorio"],
-                status: "active",
-                createdAt: nowISO()
-              });
-            }
-          });
+      { key: "do", html: `<button class="btn ok" data-action="do" value="default">Importar (simular)</button>`, onClick: async () => {
+          for (let i=0;i<5;i++){
+            await fsCreateContact({
+              name: `Importado ${i+1}`,
+              phone: `+5213311111${String(20+i)}`,
+              tags: ["auditorio"],
+              status: "active",
+            });
+          }
           modal.close();
           render();
         }
