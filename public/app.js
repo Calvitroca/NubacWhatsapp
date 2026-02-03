@@ -96,7 +96,6 @@ async function fsDeleteCampaign(id) {
 
 // --- SCHEDULES (Programación) ---
 async function fsListSchedules() {
-    // Ordenar por fecha de programación ascendente (próximos eventos primero)
     const snap = await schedulesRef().orderBy("scheduledAt", "asc").get();
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
 }
@@ -177,6 +176,22 @@ async function fsDeleteMedia(mediaId) {
         }
         await mediaRef().doc(mediaId).delete();
     }
+}
+
+// --- HELPERS ADICIONALES (NUEVO) ---
+function toDatetimeLocal(ts) {
+    if (!ts) return "";
+    const d = ts.toDate();
+    const pad = (n) => n.toString().padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function getMediaUrl(mediaId) {
+    if (!mediaId) return null;
+    try {
+        const doc = await mediaRef().doc(mediaId).get();
+        return doc.exists ? doc.data().url : null;
+    } catch (e) { return null; }
 }
 
 // --- KPI DASHBOARD ---
@@ -482,17 +497,17 @@ function openUploadMediaModal() {
     ]);
 }
 
-// --- CAMPAIGNS ---
+// --- CAMPAIGNS (MODIFICADO: Botón Programar y Checkbox en Modal) ---
 async function renderCampaignsFS() {
     const campaigns = await fsListCampaigns();
     const rows = campaigns.map(c => `
         <tr>
             <td><b>${escapeHTML(c.title)}</b></td>
             <td class="muted">${escapeHTML(c.teaserText).substring(0, 30)}...</td>
-            <td class="muted">${escapeHTML(c.detailText).substring(0, 30)}...</td>
             <td>
-                <button class="btn ghost" data-edit="${c.id}">Editar</button>
-                <button class="btn danger" data-del="${c.id}">Borrar</button>
+                <button class="btn ok small" data-schedule="${c.id}">Programar</button>
+                <button class="btn ghost small" data-edit="${c.id}">Editar</button>
+                <button class="btn danger small" data-del="${c.id}">Borrar</button>
             </td>
         </tr>`).join("");
 
@@ -503,12 +518,13 @@ async function renderCampaignsFS() {
         </div>
         <div class="card" style="margin-top:12px">
             <table class="table">
-                <thead><tr><th>Título</th><th>Teaser</th><th>Detalle</th><th>Acciones</th></tr></thead>
-                <tbody>${rows || '<tr><td colspan="4">Sin campañas.</td></tr>'}</tbody>
+                <thead><tr><th>Título</th><th>Teaser</th><th>Acciones</th></tr></thead>
+                <tbody>${rows || '<tr><td colspan="3">Sin campañas.</td></tr>'}</tbody>
             </table>
         </div>`;
 
     $("#btnNewCampaign").onclick = () => openCampaignModalFS();
+    $$("[data-schedule]").forEach(b => b.onclick = () => openScheduleModal(campaigns, b.dataset.schedule));
     $$("[data-edit]").forEach(b => b.onclick = () => openCampaignModalFS(campaigns.find(x => x.id === b.dataset.edit)));
     $$("[data-del]").forEach(b => b.onclick = async () => {
         if (confirm("¿Eliminar campaña?")) { await fsDeleteCampaign(b.dataset.del); render(); }
@@ -517,10 +533,7 @@ async function renderCampaignsFS() {
 
 async function openCampaignModalFS(campaign = null) {
     const isEdit = !!campaign;
-    
-    // Cargar Media desde Firestore
     const mediaList = await fsListMedia();
-    
     const mediaOpts = (selId) => {
         return `<option value="">(Sin media)</option>` + 
                mediaList.map(m => `<option value="${m.id}" ${selId === m.id ? "selected" : ""}>${m.type} · ${escapeHTML(m.alias)}</option>`).join("");
@@ -539,49 +552,81 @@ async function openCampaignModalFS(campaign = null) {
             <div class="field"><label>Reject Text</label><input class="input" id="cmpReject" value="${campaign ? escapeAttr(campaign.rejectText) : "Entendido, no enviaremos más."}" /></div>
             <div class="field"><label>Error Text</label><input class="input" id="cmpError" value="${campaign ? escapeAttr(campaign.errorText) : "Ocurrió un error."}" /></div>
         </div>
+        <hr/>
+        <div class="field">
+            <label><input type="checkbox" id="chkSched"> Programar al guardar</label>
+            <input type="datetime-local" class="input" id="cmpSchedDate" style="display:none; margin-top:5px;">
+        </div>
     `, [
         { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
         { key: "save", html: `<button class="btn ok">${isEdit ? "Guardar" : "Crear"}</button>`, onClick: async () => {
-            const data = {
-                title: $("#cmpTitle").value.trim(),
-                teaserText: $("#cmpTeaser").value.trim(),
-                teaserMediaId: $("#cmpTeaserMedia").value || null,
-                detailText: $("#cmpDetail").value.trim(),
-                detailMediaId: $("#cmpDetailMedia").value || null,
-                rejectText: $("#cmpReject").value.trim(),
-                errorText: $("#cmpError").value.trim()
-            };
+            try {
+                const data = {
+                    title: $("#cmpTitle").value.trim(),
+                    teaserText: $("#cmpTeaser").value.trim(),
+                    teaserMediaId: $("#cmpTeaserMedia").value || null,
+                    detailText: $("#cmpDetail").value.trim(),
+                    detailMediaId: $("#cmpDetailMedia").value || null,
+                    rejectText: $("#cmpReject").value.trim(),
+                    errorText: $("#cmpError").value.trim()
+                };
 
-            if (!data.title || !data.teaserText || !data.detailText) {
-                return alert("Título, Teaser y Detalle son obligatorios.");
-            }
+                if (!data.title || !data.teaserText || !data.detailText) return alert("Título, Teaser y Detalle requeridos.");
 
-            isEdit ? await fsUpdateCampaign(campaign.id, data) : await fsCreateCampaign(data);
-            modal.close();
-            render();
+                let docRef;
+                if (isEdit) {
+                    await fsUpdateCampaign(campaign.id, data);
+                    docRef = { id: campaign.id }; // Simulamos ref para reutilizar lógica
+                } else {
+                    docRef = await fsCreateCampaign(data);
+                }
+
+                // Programar al guardar
+                if ($("#chkSched").checked) {
+                    const dateVal = $("#cmpSchedDate").value;
+                    if (!dateVal) throw new Error("Selecciona fecha de programación");
+                    await fsCreateSchedule({
+                        campaignId: docRef.id,
+                        campaignTitle: data.title,
+                        target: { type: "all" },
+                        scheduledAt: firebase.firestore.Timestamp.fromDate(new Date(dateVal)),
+                        status: "pending"
+                    });
+                    modal.close();
+                    currentRoute = "calendar";
+                    render();
+                } else {
+                    modal.close();
+                    render();
+                }
+            } catch(e) { alert(e.message); }
         }}
     ]);
+    
+    // Toggle date input
+    $("#chkSched").onchange = (e) => $("#cmpSchedDate").style.display = e.target.checked ? "block" : "none";
 }
 
-// --- CALENDAR (Schedules) ---
+// --- CALENDAR (MODIFICADO: Vista Previa, Editar, Selector Persistente) ---
 async function renderCalendarFS() {
-    const schedules = await fsListSchedules();
+    const [schedules, campaigns] = await Promise.all([fsListSchedules(), fsListCampaigns()]);
     
-    const rows = schedules.map(s => {
-        // Formatear fecha
-        const dateStr = s.scheduledAt ? s.scheduledAt.toDate().toLocaleString() : "Sin fecha";
-        
-        // Formatear audiencia
-        let audienceStr = "-";
-        if (s.target?.type === "all") audienceStr = "Todos";
-        else if (s.target?.type === "tags") audienceStr = `Tags: ${(s.target.tags || []).join(", ")}`;
-        else if (s.target?.type === "contacts") audienceStr = `${(s.target.contactIds || []).length} contactos`;
+    // UI Panel Vista Previa
+    const previewContainer = `
+        <div id="calendarPreview" class="card" style="margin-bottom:20px; border-left: 5px solid var(--primary);">
+            <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+                <div style="font-weight:bold">Vista previa de campaña</div>
+                <select id="previewSelector" class="input" style="width:auto; height:32px; padding:0 10px;">
+                    <option value="">-- Selecciona una campaña --</option>
+                    ${campaigns.map(c => `<option value="${c.id}">${escapeHTML(c.title)}</option>`).join("")}
+                </select>
+            </div>
+            <div id="previewContent" class="muted">Selecciona una campaña para previsualizar el contenido.</div>
+        </div>`;
 
-        // Botones de acción
-        let actionsHtml = `<button class="btn danger small" data-del="${s.id}">Borrar</button>`;
-        if (s.status === "pending") {
-            actionsHtml = `<button class="btn ghost small" data-cancel="${s.id}">Cancelar</button> ` + actionsHtml;
-        }
+    const rows = schedules.map(s => {
+        const dateStr = s.scheduledAt ? s.scheduledAt.toDate().toLocaleString() : "Sin fecha";
+        let audienceStr = s.target?.type === "all" ? "Todos" : (s.target?.tags ? `Tags: ${s.target.tags.join(",")}` : "-");
 
         return `
         <tr>
@@ -589,38 +634,87 @@ async function renderCalendarFS() {
             <td>${dateStr}</td>
             <td>${escapeHTML(audienceStr)}</td>
             <td><span class="badge ${s.status === 'pending' ? '' : 'muted'}">${escapeHTML(s.status)}</span></td>
-            <td>${actionsHtml}</td>
+            <td>
+                ${s.status === 'pending' ? `<button class="btn ghost small" data-edit-sch="${s.id}">Editar</button>` : ''}
+                <button class="btn danger small" data-del="${s.id}">Borrar</button>
+            </td>
         </tr>`;
     }).join("");
 
     viewRoot.innerHTML = `
-        <div class="row" style="justify-content:space-between">
+        <div class="row" style="justify-content:space-between; margin-bottom:12px;">
             <button class="btn" id="btnNewSchedule">Programar campaña</button>
             <div class="badge">${schedules.length} programadas</div>
         </div>
-        <div class="card" style="margin-top:12px">
+        ${previewContainer}
+        <div class="card">
             <table class="table">
                 <thead><tr><th>Campaña</th><th>Fecha/Hora</th><th>Audiencia</th><th>Status</th><th>Acciones</th></tr></thead>
                 <tbody>${rows || '<tr><td colspan="5">No hay envíos programados.</td></tr>'}</tbody>
             </table>
         </div>`;
 
-    $("#btnNewSchedule").onclick = () => openScheduleModal();
+    // Event handlers
+    const sel = $("#previewSelector");
+    sel.onchange = () => updateCampaignPreview(campaigns.find(c => c.id === sel.value));
+
+    $("#btnNewSchedule").onclick = () => openScheduleModal(campaigns);
     
-    $$("[data-cancel]").forEach(b => b.onclick = async () => {
-        if (confirm("¿Cancelar este envío?")) { await fsCancelSchedule(b.dataset.cancel); render(); }
+    $$("[data-edit-sch]").forEach(b => b.onclick = () => {
+        const sch = schedules.find(x => x.id === b.dataset.editSch);
+        openScheduleEditModal(sch, campaigns);
     });
-    
+
     $$("[data-del]").forEach(b => b.onclick = async () => {
-        if (confirm("¿Borrar registro?")) { await fsDeleteSchedule(b.dataset.del); render(); }
+        if (confirm("¿Borrar registro?")) { try { await fsDeleteSchedule(b.dataset.del); render(); } catch(e){alert(e.message)} }
     });
 }
 
-async function openScheduleModal() {
-    const campaigns = await fsListCampaigns();
+// Lógica para actualizar el DOM del preview panel
+async function updateCampaignPreview(campaign) {
+    const container = $("#previewContent");
+    if (!campaign) {
+        container.innerHTML = "Selecciona una campaña";
+        return;
+    }
+
+    container.innerHTML = "Cargando preview...";
+    const [teaserUrl, detailUrl] = await Promise.all([
+        getMediaUrl(campaign.teaserMediaId),
+        getMediaUrl(campaign.detailMediaId)
+    ]);
+
+    const renderMedia = (url) => {
+        if (!url) return "";
+        return url.includes(".mp4") || url.includes(".mov") 
+            ? `<video src="${url}" style="max-height:100px; display:block; margin:5px 0;" controls></video>`
+            : `<img src="${url}" style="max-height:100px; display:block; margin:5px 0; border-radius:4px;">`;
+    };
+
+    container.innerHTML = `
+        <div class="grid cols2" style="gap:15px; font-size:0.9em;">
+            <div style="border-right:1px solid #eee; padding-right:10px;">
+                <div class="badge">Teaser (Mensaje 1)</div>
+                <div style="margin:5px 0;">${escapeHTML(campaign.teaserText)}</div>
+                ${renderMedia(teaserUrl)}
+            </div>
+            <div>
+                <div class="badge">Detalle (Respuesta)</div>
+                <div style="margin:5px 0;">${escapeHTML(campaign.detailText)}</div>
+                ${renderMedia(detailUrl)}
+            </div>
+        </div>
+        <div style="margin-top:8px; font-size:0.75em; opacity:0.7;">
+            <b>Rechazo:</b> ${escapeHTML(campaign.rejectText)} | <b>Error:</b> ${escapeHTML(campaign.errorText)}
+        </div>`;
+}
+
+// Modal de creación (actualizado para aceptar preselección)
+async function openScheduleModal(campaigns, preselectId = null) {
+    if (!campaigns || campaigns.length === 0) campaigns = await fsListCampaigns();
     if (campaigns.length === 0) return alert("Primero crea una campaña.");
 
-    const campOptions = campaigns.map(c => `<option value="${c.id}">${escapeHTML(c.title)}</option>`).join("");
+    const campOptions = campaigns.map(c => `<option value="${c.id}" ${preselectId === c.id ? "selected" : ""}>${escapeHTML(c.title)}</option>`).join("");
 
     openModal("Programar Envío", `
         <div class="field">
@@ -681,6 +775,40 @@ async function openScheduleModal() {
     typeSel.addEventListener("change", () => {
         divTags.style.display = typeSel.value === "tags" ? "block" : "none";
     });
+}
+
+// Modal de edición de Schedule (NUEVO)
+async function openScheduleEditModal(schedule, campaigns) {
+    const campOptions = campaigns.map(c => `<option value="${c.id}" ${schedule.campaignId === c.id ? "selected" : ""}>${escapeHTML(c.title)}</option>`).join("");
+    const isTags = schedule.target?.type === "tags";
+
+    openModal("Editar Programación", `
+        <div class="field"><label>Campaña</label><select class="input" id="eCampId">${campOptions}</select></div>
+        <div class="field"><label>Fecha y Hora</label><input type="datetime-local" class="input" id="eDate" value="${toDatetimeLocal(schedule.scheduledAt)}" /></div>
+        <div class="field"><label>Audiencia</label><select class="input" id="eType"><option value="all" ${!isTags ? "selected" : ""}>Todos</option><option value="tags" ${isTags ? "selected" : ""}>Tags</option></select></div>
+        <div class="field" id="edivTags" style="display:${isTags ? "block" : "none"}"><label>Tags (comas)</label><input class="input" id="eTags" value="${isTags ? (schedule.target.tags || []).join(",") : ""}" /></div>
+        <div class="field"><label>Estado</label><select class="input" id="eStatus"><option value="pending">pending</option><option value="cancelled">cancelled</option></select></div>
+    `, [
+        { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
+        { key: "save", html: `<button class="btn ok">Actualizar</button>`, onClick: async () => {
+            try {
+                const cId = $("#eCampId").value;
+                const data = {
+                    campaignId: cId,
+                    campaignTitle: campaigns.find(x => x.id === cId).title,
+                    target: $("#eType").value === "all" ? { type: "all" } : { type: "tags", tags: $("#eTags").value.split(",").map(t => t.trim()).filter(Boolean) },
+                    scheduledAt: firebase.firestore.Timestamp.fromDate(new Date($("#eDate").value)),
+                    status: $("#eStatus").value
+                };
+                await fsUpdateSchedule(schedule.id, data);
+                modal.close();
+                render();
+            } catch(e) { alert(e.message); }
+        }}
+    ]);
+
+    $("#eType").onchange = (e) => $("#edivTags").style.display = e.target.value === "tags" ? "block" : "none";
+    $("#eStatus").value = schedule.status;
 }
 
 // --- VISTAS DEMO RESTANTES (History) ---
