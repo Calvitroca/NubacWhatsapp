@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WhatsApp Sender — Demo</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">WA</div>
+        <div class="brand-text">
+          <div class="name">WhatsApp Sender</div>
+          <div class="sub">Mailchimp-like (demo)</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-route="dashboard">Dashboard</button>
+        <button class="nav-item" data-route="contacts">Contactos</button>
+        <button class="nav-item" data-route="media">Media</button>
+        <button class="nav-item" data-route="campaigns">Campañas</button>
+        <button class="nav-item" data-route="calendar">Calendario</button>
+        <button class="nav-item" data-route="history">Historial</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="btn ghost" id="btnResetDemo">Reset demo</button>
+        <div class="tiny">LocalStorage · SPA · HTML/CSS/JS</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="viewTitle">Dashboard</h1>
+          <p class="muted" id="viewSubtitle">Resumen de envíos y actividad.</p>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn" id="btnSeedDemo">Cargar demo</button>
+        </div>
+      </header>
+
+      <section id="viewRoot" class="view"></section>
+    </main>
+  </div>
+
+  <dialog id="modal" class="modal">
+    <form method="dialog" class="modal-card">
+      <div class="modal-head">
+        <h3 id="modalTitle">Modal</h3>
+        <button class="btn ghost" value="cancel" aria-label="Cerrar">✕</button>
+      </div>
+      <div id="modalBody" class="modal-body"></div>
+      <div id="modalActions" class="modal-actions"></div>
+    </form>
+  </dialog>
+
+  <script src="./app.js"></script>
+</body>
+</html>
