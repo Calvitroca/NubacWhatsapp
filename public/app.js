@@ -16,6 +16,196 @@ const auth = firebase.auth();
 const dbFS = firebase.firestore(); // 👈 PÉGALO AQUÍ
 const provider = new firebase.auth.GoogleAuthProvider();
 
+/* =========================
+   CONTACTOS -> FIRESTORE
+   ========================= */
+
+function contactsRef() {
+  const u = auth.currentUser;
+  if (!u) throw new Error("No hay usuario logueado");
+  return dbFS.collection("users").doc(u.uid).collection("contacts");
+}
+
+async function fsListContacts() {
+  const snap = await contactsRef().orderBy("createdAt", "desc").get();
+  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+}
+
+async function fsCreateContact({ name, phone, tags, status }) {
+  const payload = {
+    name,
+    phone,
+    tags: Array.isArray(tags) ? tags : [],
+    status: status || "active",
+    createdAt: nowISO(),
+    updatedAt: nowISO(),
+  };
+  await contactsRef().add(payload);
+}
+
+async function fsUpdateContact(id, { name, phone, tags, status }) {
+  const payload = {
+    name,
+    phone,
+    tags: Array.isArray(tags) ? tags : [],
+    status: status || "active",
+    updatedAt: nowISO(),
+  };
+  await contactsRef().doc(id).set(payload, { merge: true });
+}
+
+async function fsDeleteContact(id) {
+  await contactsRef().doc(id).delete();
+}
+
+/* ---------- UI Contacts (Firestore) ---------- */
+
+async function renderContactsFS() {
+  const contacts = await fsListContacts();
+
+  const rows = contacts.map((c) => `
+    <tr>
+      <td>
+        <b>${escapeHTML(c.name || "")}</b>
+        <div class="tiny muted">${escapeHTML(c.phone || "")}</div>
+      </td>
+      <td>${(c.tags || []).map((t) => `<span class="badge">${escapeHTML(t)}</span>`).join(" ")}</td>
+      <td>${escapeHTML(c.status || "active")}</td>
+      <td>
+        <button class="btn ghost" data-edit="${c.id}">Editar</button>
+        <button class="btn danger" data-del="${c.id}">Borrar</button>
+      </td>
+    </tr>
+  `).join("");
+
+  viewRoot.innerHTML = `
+    <div class="row" style="justify-content:space-between">
+      <div class="row">
+        <button class="btn" id="btnNewContact">Nuevo contacto</button>
+        <button class="btn ghost" id="btnImportCSV">Importar CSV (demo)</button>
+      </div>
+      <div class="badge">${contacts.length} contactos</div>
+    </div>
+    <div style="height:12px"></div>
+    <div class="card">
+      <table class="table">
+        <thead>
+          <tr><th>Contacto</th><th>Tags</th><th>Estado</th><th>Acciones</th></tr>
+        </thead>
+        <tbody>${rows || `<tr><td colspan="4">Sin contactos.</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+
+  $("#btnNewContact")?.addEventListener("click", () => openContactModalFS(null));
+  $("#btnImportCSV")?.addEventListener("click", () => importCSVModalFS());
+
+  $$("[data-edit]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const id = b.getAttribute("data-edit");
+      const c = contacts.find((x) => x.id === id);
+      if (c) openContactModalFS(c);
+    })
+  );
+
+  $$("[data-del]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const id = b.getAttribute("data-del");
+      await fsDeleteContact(id);
+      await renderContactsFS();
+    })
+  );
+}
+
+function openContactModalFS(contact = null) {
+  const isEdit = !!contact;
+
+  openModal(
+    isEdit ? "Editar contacto" : "Nuevo contacto",
+    `
+      <div class="field">
+        <label>Nombre</label>
+        <input class="input" id="cName" value="${contact ? escapeAttr(contact.name || "") : ""}" />
+      </div>
+      <div class="field">
+        <label>Teléfono WhatsApp (E.164)</label>
+        <input class="input" id="cPhone" placeholder="+52133..." value="${contact ? escapeAttr(contact.phone || "") : ""}" />
+      </div>
+      <div class="field">
+        <label>Tags (separados por coma)</label>
+        <input class="input" id="cTags" placeholder="clientes,felicat" value="${contact ? escapeAttr((contact.tags || []).join(",")) : ""}" />
+      </div>
+      <div class="field">
+        <label>Estado</label>
+        <select id="cStatus">
+          <option value="active">active</option>
+          <option value="inactive">inactive</option>
+        </select>
+      </div>
+    `,
+    [
+      {
+        key: "cancel",
+        html: `<button class="btn ghost" data-action="cancel" value="cancel">Cancelar</button>`,
+        onClick: () => modal.close(),
+      },
+      {
+        key: "save",
+        html: `<button class="btn ok" data-action="save" value="default">${isEdit ? "Guardar" : "Crear"}</button>`,
+        onClick: async () => {
+          const name = $("#cName").value.trim();
+          const phone = $("#cPhone").value.trim();
+          const tags = $("#cTags").value.split(",").map((t) => t.trim()).filter(Boolean);
+          const status = $("#cStatus").value;
+
+          if (!name || !phone) return alert("Nombre y teléfono son obligatorios.");
+
+          if (isEdit) {
+            await fsUpdateContact(contact.id, { name, phone, tags, status });
+          } else {
+            await fsCreateContact({ name, phone, tags, status });
+          }
+
+          modal.close();
+          await renderContactsFS();
+        },
+      },
+    ]
+  );
+
+  if (contact) $("#cStatus").value = contact.status || "active";
+}
+
+function importCSVModalFS() {
+  openModal(
+    "Importar CSV (demo)",
+    `
+      <div class="muted">Este botón creará 5 contactos extra en Firestore.</div>
+      <hr />
+      <div class="tiny muted">Formato típico: name,phone,tags</div>
+    `,
+    [
+      { key: "cancel", html: `<button class="btn ghost" data-action="cancel" value="cancel">Cerrar</button>`, onClick: () => modal.close() },
+      {
+        key: "do",
+        html: `<button class="btn ok" data-action="do" value="default">Importar (simular)</button>`,
+        onClick: async () => {
+          for (let i = 0; i < 5; i++) {
+            await fsCreateContact({
+              name: `Importado ${i + 1}`,
+              phone: `+5213311111${String(20 + i)}`,
+              tags: ["auditorio"],
+              status: "active",
+            });
+          }
+          modal.close();
+          await renderContactsFS();
+        },
+      },
+    ]
+  );
+}
+
 async function fsListContacts() {
   const snap = await contactsRef().orderBy("createdAt", "desc").get();
   return snap.docs.map(d => ({ id: d.id, ...d.data() }));
@@ -352,7 +542,7 @@ function render() {
 
   const db = getDB();
   if (currentRoute === "dashboard") return renderDashboard(db);
-  if (currentRoute === "contacts") return renderContacts(db); // puede ser async, ok
+  if (currentRoute === "contacts") return renderContactsFS();
   if (currentRoute === "media") return renderMedia(db);
   if (currentRoute === "campaigns") return renderCampaigns(db);
   if (currentRoute === "calendar") return renderCalendar(db);
