@@ -104,6 +104,8 @@ async function fsCreateSchedule(data) {
     const payload = {
         ...data,
         status: data.status || "pending",
+        processedCount: 0,
+        cursor: null,
         createdAt: firebase.firestore.FieldValue.serverTimestamp(),
         updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     };
@@ -178,7 +180,7 @@ async function fsDeleteMedia(mediaId) {
     }
 }
 
-// --- HELPERS ADICIONALES (NUEVO) ---
+// --- HELPERS ADICIONALES ---
 function toDatetimeLocal(ts) {
     if (!ts) return "";
     const d = ts.toDate();
@@ -192,6 +194,32 @@ async function getMediaUrl(mediaId) {
         const doc = await mediaRef().doc(mediaId).get();
         return doc.exists ? doc.data().url : null;
     } catch (e) { return null; }
+}
+
+// NUEVOS HELPERS API
+async function apiFetch(path, options = {}) {
+    const token = await getIdToken();
+    const headers = {
+        'Content-Type': 'application/json',
+        ...options.headers
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    return fetch(path, { ...options, headers });
+}
+
+async function runSchedulesNow() {
+    try {
+        const res = await apiFetch('/api/runSchedulesNow', { method: 'POST' });
+        if (res.ok) {
+            const data = await res.json();
+            return { success: true, message: data.message || "Procesamiento iniciado." };
+        } else {
+            return { success: false, message: "Schedule creado. El envío saldrá cuando el cron/worker se ejecute." };
+        }
+    } catch (e) {
+        return { success: false, message: "Schedule creado. El envío saldrá cuando el cron/worker se ejecute." };
+    }
 }
 
 // --- KPI DASHBOARD ---
@@ -316,7 +344,7 @@ async function render() {
     // Activar Nav
     $$(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.route === currentRoute));
 
-    const dbLocal = getDB(); // Solo para demos restantes (History)
+    const dbLocal = getDB();
 
     switch (currentRoute) {
         case "dashboard": await renderDashboard(); break;
@@ -357,7 +385,7 @@ async function renderDashboard() {
                 <hr/><div class="muted">Datos actualizados desde la nube.</div>
             </div>
             <div class="card">
-                <b>Atajo: Enviar ahora</b><hr/>
+                <b>Atajo: Envío Rápido</b><hr/>
                 ${quickSendUI()}
             </div>
         </div>`;
@@ -425,8 +453,6 @@ function openContactModalFS(contact = null) {
 // --- MEDIA ---
 async function renderMediaFS() {
     const mediaList = await fsListMedia();
-    
-    // Grid de Media Items
     const cards = mediaList.map(m => {
         const preview = m.type === "video" 
             ? `<video src="${m.url}" style="width:100%; height:120px; object-fit:cover; background:#000;" controls></video>` 
@@ -475,14 +501,11 @@ function openUploadMediaModal() {
             const fileInput = $("#uFile");
             const file = fileInput.files[0];
             const alias = $("#uAlias").value.trim();
-            
             if (!file) return alert("Selecciona un archivo.");
-            
             const btn = e.target;
             btn.disabled = true;
             btn.textContent = "Subiendo...";
             $("#uProgress").style.display = "block";
-            
             try {
                 await uploadMediaFile(file, alias);
                 modal.close();
@@ -497,7 +520,7 @@ function openUploadMediaModal() {
     ]);
 }
 
-// --- CAMPAIGNS (MODIFICADO: Botón Programar y Checkbox en Modal) ---
+// --- CAMPAIGNS ---
 async function renderCampaignsFS() {
     const campaigns = await fsListCampaigns();
     const rows = campaigns.map(c => `
@@ -505,7 +528,8 @@ async function renderCampaignsFS() {
             <td><b>${escapeHTML(c.title)}</b></td>
             <td class="muted">${escapeHTML(c.teaserText).substring(0, 30)}...</td>
             <td>
-                <button class="btn ok small" data-schedule="${c.id}">Programar</button>
+                <button class="btn ok small" data-sendnow="${c.id}">Enviar ahora</button>
+                <button class="btn ok small" data-schedule="${c.id}" style="background:var(--secondary)">Programar</button>
                 <button class="btn ghost small" data-edit="${c.id}">Editar</button>
                 <button class="btn danger small" data-del="${c.id}">Borrar</button>
             </td>
@@ -524,11 +548,67 @@ async function renderCampaignsFS() {
         </div>`;
 
     $("#btnNewCampaign").onclick = () => openCampaignModalFS();
+    $$("[data-sendnow]").forEach(b => b.onclick = () => openSendNowModal(campaigns.find(x => x.id === b.dataset.sendnow)));
     $$("[data-schedule]").forEach(b => b.onclick = () => openScheduleModal(campaigns, b.dataset.schedule));
     $$("[data-edit]").forEach(b => b.onclick = () => openCampaignModalFS(campaigns.find(x => x.id === b.dataset.edit)));
     $$("[data-del]").forEach(b => b.onclick = async () => {
         if (confirm("¿Eliminar campaña?")) { await fsDeleteCampaign(b.dataset.del); render(); }
     });
+}
+
+function openSendNowModal(campaign) {
+    if (!campaign) return;
+    openModal(`Enviar ahora: ${campaign.title}`, `
+        <div class="field">
+            <label>Audiencia</label>
+            <select class="input" id="snType">
+                <option value="all">Todos los contactos</option>
+                <option value="tags">Por etiquetas (tags)</option>
+            </select>
+        </div>
+        <div class="field" id="snDivTags" style="display:none">
+            <label>Tags (separados por coma)</label>
+            <input class="input" id="snTags" placeholder="vip, cliente, etc" />
+        </div>
+        <div id="snLoading" class="tiny muted" style="display:none">Procesando envío...</div>
+    `, [
+        { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
+        { key: "send", html: `<button class="btn ok">Enviar</button>`, onClick: async (e) => {
+            const btn = e.target;
+            const type = $("#snType").value;
+            const tags = $("#snTags").value.split(",").map(t => t.trim()).filter(Boolean);
+            
+            if (type === "tags" && tags.length === 0) return alert("Ingresa al menos un tag.");
+
+            btn.disabled = true;
+            btn.textContent = "Enviando...";
+            $("#snLoading").style.display = "block";
+
+            try {
+                // 1. Crear el Schedule con status pending y fecha actual
+                await fsCreateSchedule({
+                    campaignId: campaign.id,
+                    campaignTitle: campaign.title,
+                    target: type === "all" ? { type: "all" } : { type: "tags", tags },
+                    scheduledAt: firebase.firestore.Timestamp.now(),
+                    status: "pending"
+                });
+
+                // 2. Intentar disparar el worker
+                const result = await runSchedulesNow();
+                alert(result.message);
+                
+                modal.close();
+                navigate("calendar");
+            } catch (err) {
+                alert("Error: " + err.message);
+                btn.disabled = false;
+                btn.textContent = "Enviar";
+            }
+        }}
+    ]);
+
+    $("#snType").onchange = (e) => $("#snDivTags").style.display = e.target.value === "tags" ? "block" : "none";
 }
 
 async function openCampaignModalFS(campaign = null) {
@@ -570,31 +650,28 @@ async function openCampaignModalFS(campaign = null) {
                     rejectText: $("#cmpReject").value.trim(),
                     errorText: $("#cmpError").value.trim()
                 };
-
                 if (!data.title || !data.teaserText || !data.detailText) return alert("Título, Teaser y Detalle requeridos.");
 
-                let docRef;
+                let docId = campaign?.id;
                 if (isEdit) {
-                    await fsUpdateCampaign(campaign.id, data);
-                    docRef = { id: campaign.id }; // Simulamos ref para reutilizar lógica
+                    await fsUpdateCampaign(docId, data);
                 } else {
-                    docRef = await fsCreateCampaign(data);
+                    const docRef = await fsCreateCampaign(data);
+                    docId = docRef.id;
                 }
 
-                // Programar al guardar
                 if ($("#chkSched").checked) {
                     const dateVal = $("#cmpSchedDate").value;
                     if (!dateVal) throw new Error("Selecciona fecha de programación");
                     await fsCreateSchedule({
-                        campaignId: docRef.id,
+                        campaignId: docId,
                         campaignTitle: data.title,
                         target: { type: "all" },
                         scheduledAt: firebase.firestore.Timestamp.fromDate(new Date(dateVal)),
                         status: "pending"
                     });
                     modal.close();
-                    currentRoute = "calendar";
-                    render();
+                    navigate("calendar");
                 } else {
                     modal.close();
                     render();
@@ -602,16 +679,13 @@ async function openCampaignModalFS(campaign = null) {
             } catch(e) { alert(e.message); }
         }}
     ]);
-    
-    // Toggle date input
     $("#chkSched").onchange = (e) => $("#cmpSchedDate").style.display = e.target.checked ? "block" : "none";
 }
 
-// --- CALENDAR (MODIFICADO: Vista Previa, Editar, Selector Persistente) ---
+// --- CALENDAR ---
 async function renderCalendarFS() {
     const [schedules, campaigns] = await Promise.all([fsListSchedules(), fsListCampaigns()]);
     
-    // UI Panel Vista Previa
     const previewContainer = `
         <div id="calendarPreview" class="card" style="margin-bottom:20px; border-left: 5px solid var(--primary);">
             <div class="row" style="justify-content:space-between; margin-bottom:10px;">
@@ -654,134 +728,73 @@ async function renderCalendarFS() {
             </table>
         </div>`;
 
-    // Event handlers
     const sel = $("#previewSelector");
-    sel.onchange = () => updateCampaignPreview(campaigns.find(c => c.id === sel.value));
+    if(sel) sel.onchange = () => updateCampaignPreview(campaigns.find(c => c.id === sel.value));
 
     $("#btnNewSchedule").onclick = () => openScheduleModal(campaigns);
-    
-    $$("[data-edit-sch]").forEach(b => b.onclick = () => {
-        const sch = schedules.find(x => x.id === b.dataset.editSch);
-        openScheduleEditModal(sch, campaigns);
-    });
-
+    $$("[data-edit-sch]").forEach(b => b.onclick = () => openScheduleEditModal(schedules.find(x => x.id === b.dataset.editSch), campaigns));
     $$("[data-del]").forEach(b => b.onclick = async () => {
         if (confirm("¿Borrar registro?")) { try { await fsDeleteSchedule(b.dataset.del); render(); } catch(e){alert(e.message)} }
     });
 }
 
-// Lógica para actualizar el DOM del preview panel
 async function updateCampaignPreview(campaign) {
     const container = $("#previewContent");
-    if (!campaign) {
-        container.innerHTML = "Selecciona una campaña";
-        return;
-    }
-
+    if (!campaign) { container.innerHTML = "Selecciona una campaña"; return; }
     container.innerHTML = "Cargando preview...";
-    const [teaserUrl, detailUrl] = await Promise.all([
-        getMediaUrl(campaign.teaserMediaId),
-        getMediaUrl(campaign.detailMediaId)
-    ]);
-
+    const [teaserUrl, detailUrl] = await Promise.all([getMediaUrl(campaign.teaserMediaId), getMediaUrl(campaign.detailMediaId)]);
     const renderMedia = (url) => {
         if (!url) return "";
         return url.includes(".mp4") || url.includes(".mov") 
             ? `<video src="${url}" style="max-height:100px; display:block; margin:5px 0;" controls></video>`
             : `<img src="${url}" style="max-height:100px; display:block; margin:5px 0; border-radius:4px;">`;
     };
-
     container.innerHTML = `
         <div class="grid cols2" style="gap:15px; font-size:0.9em;">
             <div style="border-right:1px solid #eee; padding-right:10px;">
-                <div class="badge">Teaser (Mensaje 1)</div>
+                <div class="badge">Teaser</div>
                 <div style="margin:5px 0;">${escapeHTML(campaign.teaserText)}</div>
                 ${renderMedia(teaserUrl)}
             </div>
             <div>
-                <div class="badge">Detalle (Respuesta)</div>
+                <div class="badge">Detalle</div>
                 <div style="margin:5px 0;">${escapeHTML(campaign.detailText)}</div>
                 ${renderMedia(detailUrl)}
             </div>
-        </div>
-        <div style="margin-top:8px; font-size:0.75em; opacity:0.7;">
-            <b>Rechazo:</b> ${escapeHTML(campaign.rejectText)} | <b>Error:</b> ${escapeHTML(campaign.errorText)}
         </div>`;
 }
 
-// Modal de creación (actualizado para aceptar preselección)
 async function openScheduleModal(campaigns, preselectId = null) {
-    if (!campaigns || campaigns.length === 0) campaigns = await fsListCampaigns();
     if (campaigns.length === 0) return alert("Primero crea una campaña.");
-
     const campOptions = campaigns.map(c => `<option value="${c.id}" ${preselectId === c.id ? "selected" : ""}>${escapeHTML(c.title)}</option>`).join("");
-
     openModal("Programar Envío", `
-        <div class="field">
-            <label>Campaña</label>
-            <select class="input" id="sCampId">${campOptions}</select>
-        </div>
-        <div class="field">
-            <label>Fecha y Hora</label>
-            <input type="datetime-local" class="input" id="sDate" />
-        </div>
-        <div class="field">
-            <label>Audiencia</label>
-            <select class="input" id="sType">
-                <option value="all">Todos los contactos</option>
-                <option value="tags">Por etiquetas (tags)</option>
-            </select>
-        </div>
-        <div class="field" id="divTags" style="display:none">
-            <label>Tags (separados por coma)</label>
-            <input class="input" id="sTags" placeholder="vip, promo, etc" />
-        </div>
+        <div class="field"><label>Campaña</label><select class="input" id="sCampId">${campOptions}</select></div>
+        <div class="field"><label>Fecha y Hora</label><input type="datetime-local" class="input" id="sDate" /></div>
+        <div class="field"><label>Audiencia</label><select class="input" id="sType"><option value="all">Todos</option><option value="tags">Tags</option></select></div>
+        <div class="field" id="divTags" style="display:none"><label>Tags (comas)</label><input class="input" id="sTags" /></div>
     `, [
         { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
         { key: "save", html: `<button class="btn ok">Guardar</button>`, onClick: async () => {
-            const campId = $("#sCampId").value;
-            const dateVal = $("#sDate").value;
-            const typeVal = $("#sType").value;
-            const tagsVal = $("#sTags").value;
-
-            if (!campId || !dateVal) return alert("Campaña y Fecha requeridas.");
-
-            const selectedCamp = campaigns.find(c => c.id === campId);
-            const target = { type: typeVal };
-            
-            if (typeVal === "tags") {
-                const tagsList = tagsVal.split(",").map(t => t.trim()).filter(Boolean);
-                if (tagsList.length === 0) return alert("Ingresa al menos un tag.");
-                target.tags = tagsList;
-            }
-
-            const data = {
-                campaignId: campId,
-                campaignTitle: selectedCamp ? selectedCamp.title : "Sin título",
-                target: target,
-                scheduledAt: firebase.firestore.Timestamp.fromDate(new Date(dateVal)),
+            const cId = $("#sCampId").value;
+            const date = $("#sDate").value;
+            if (!cId || !date) return alert("Requerido");
+            await fsCreateSchedule({
+                campaignId: cId,
+                campaignTitle: campaigns.find(x => x.id === cId).title,
+                target: $("#sType").value === "all" ? { type: "all" } : { type: "tags", tags: $("#sTags").value.split(",").filter(Boolean) },
+                scheduledAt: firebase.firestore.Timestamp.fromDate(new Date(date)),
                 status: "pending"
-            };
-
-            await fsCreateSchedule(data);
+            });
             modal.close();
             render();
         }}
     ]);
-
-    // Toggle Tags input
-    const typeSel = document.getElementById("sType");
-    const divTags = document.getElementById("divTags");
-    typeSel.addEventListener("change", () => {
-        divTags.style.display = typeSel.value === "tags" ? "block" : "none";
-    });
+    $("#sType").onchange = (e) => $("#divTags").style.display = e.target.value === "tags" ? "block" : "none";
 }
 
-// Modal de edición de Schedule (NUEVO)
 async function openScheduleEditModal(schedule, campaigns) {
     const campOptions = campaigns.map(c => `<option value="${c.id}" ${schedule.campaignId === c.id ? "selected" : ""}>${escapeHTML(c.title)}</option>`).join("");
     const isTags = schedule.target?.type === "tags";
-
     openModal("Editar Programación", `
         <div class="field"><label>Campaña</label><select class="input" id="eCampId">${campOptions}</select></div>
         <div class="field"><label>Fecha y Hora</label><input type="datetime-local" class="input" id="eDate" value="${toDatetimeLocal(schedule.scheduledAt)}" /></div>
@@ -791,43 +804,33 @@ async function openScheduleEditModal(schedule, campaigns) {
     `, [
         { key: "cancel", html: `<button class="btn ghost">Cancelar</button>`, onClick: () => modal.close() },
         { key: "save", html: `<button class="btn ok">Actualizar</button>`, onClick: async () => {
-            try {
-                const cId = $("#eCampId").value;
-                const data = {
-                    campaignId: cId,
-                    campaignTitle: campaigns.find(x => x.id === cId).title,
-                    target: $("#eType").value === "all" ? { type: "all" } : { type: "tags", tags: $("#eTags").value.split(",").map(t => t.trim()).filter(Boolean) },
-                    scheduledAt: firebase.firestore.Timestamp.fromDate(new Date($("#eDate").value)),
-                    status: $("#eStatus").value
-                };
-                await fsUpdateSchedule(schedule.id, data);
-                modal.close();
-                render();
-            } catch(e) { alert(e.message); }
+            const cId = $("#eCampId").value;
+            await fsUpdateSchedule(schedule.id, {
+                campaignId: cId,
+                campaignTitle: campaigns.find(x => x.id === cId).title,
+                target: $("#eType").value === "all" ? { type: "all" } : { type: "tags", tags: $("#eTags").value.split(",").filter(Boolean) },
+                scheduledAt: firebase.firestore.Timestamp.fromDate(new Date($("#eDate").value)),
+                status: $("#eStatus").value
+            });
+            modal.close();
+            render();
         }}
     ]);
-
     $("#eType").onchange = (e) => $("#edivTags").style.display = e.target.value === "tags" ? "block" : "none";
-    $("#eStatus").value = schedule.status;
 }
 
-// --- VISTAS DEMO RESTANTES (History) ---
-function renderHistory(db) { viewRoot.innerHTML = `<div class="card">Historial (Modo Demo Local)</div>`; }
-
-function quickSendUI() {
-    return `<button class="btn ok" id="qsSend">Simular Envío Masivo</button>`;
-}
-function quickSendAction() { alert("Simulación enviada a logs locales (Demo)."); }
+function renderHistory(db) { viewRoot.innerHTML = `<div class="card">Historial (Logs de Firestore)</div>`; }
+function quickSendUI() { return `<button class="btn ok" id="qsSend">Limpiar caché / Recargar</button>`; }
+function quickSendAction() { window.location.reload(); }
 
 /* ==========================================================================
-   9. LocalStorage Helpers (Solo para History Demo)
+   9. LocalStorage Helpers (Backup)
    ========================================================================== */
 const DB_KEY = "wa_sender_db_v1";
 function getDB() {
     const raw = localStorage.getItem(DB_KEY);
     return raw ? JSON.parse(raw) : { campaigns: [], schedules: [], logs: [], userStates: [], meta: { seeded: false } };
 }
-function saveDB(db) { localStorage.setItem(DB_KEY, JSON.stringify(db)); }
 
 /* ==========================================================================
    10. Boot / Inicialización
@@ -847,6 +850,5 @@ auth.onAuthStateChanged(async (user) => {
 $("#btnLogin")?.addEventListener("click", () => auth.signInWithPopup(provider));
 $("#btnLogout")?.addEventListener("click", () => auth.signOut());
 
-// Boot
 bindNav();
 navigate("dashboard");

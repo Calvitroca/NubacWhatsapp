@@ -1,5 +1,6 @@
 /**
- * Firebase Cloud Functions backend for WhatsApp “Mailchimp-like” sender using Twilio.
+ * Firebase Cloud Functions backend for WhatsApp sender using Twilio.
+ * users/{uid} structure + schedules target all/tags + 24h window w/ template fallback.
  */
 
 const admin = require("firebase-admin");
@@ -8,21 +9,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const twilio = require("twilio");
 const { onRequest } = require("firebase-functions/v2/https");
-
 const { MessagingResponse } = require("twilio").twiml;
-
-function replyTwiml(res, text) {
-  const twiml = new MessagingResponse();
-  twiml.message(text);
-  res.type("text/xml").send(twiml.toString());
-}
-
-const FALLBACK_TEXT =
-  "Hola 👋 Soy el asistente.\n\n" +
-  "Responde:\n" +
-  "1️⃣ para conocer más\n" +
-  "2️⃣ para salir\n\n" +
-  "Escribe 1 o 2 😊";
 
 admin.initializeApp();
 const db = admin.firestore();
@@ -34,38 +21,51 @@ app.use(express.json());
 // ========= CONFIG =========
 const TWILIO_SID = process.env.TWILIO_SID;
 const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
-const TWILIO_FROM = process.env.TWILIO_FROM;
-const DEFAULT_TENANT = process.env.APP_TENANT || "demo";
+let TWILIO_FROM = process.env.TWILIO_FROM; // can be "+52..." or "whatsapp:+52..."
+const CRON_SECRET = process.env.CRON_SECRET;
 
-let twilioClient;
+console.log("ENV CHECK:", {
+  TWILIO_SID: process.env.TWILIO_SID ? "OK" : "MISSING",
+  TWILIO_TOKEN: process.env.TWILIO_TOKEN ? "OK" : "MISSING",
+  TWILIO_FROM: process.env.TWILIO_FROM || "MISSING",
+  CRON_SECRET: process.env.CRON_SECRET ? "OK" : "MISSING",
+});
 
-if (TWILIO_SID && TWILIO_TOKEN) {
-  twilioClient = twilio(TWILIO_SID, TWILIO_TOKEN);
-} else {
-  console.warn("Twilio env vars missing, running in stub mode");
-  twilioClient = {
-    messages: {
-      create: async () => {
-        throw new Error("Twilio not configured");
-      },
-    },
-  };
+// Normalize "from" to whatsapp:
+function normalizeWa(addr) {
+  if (!addr) return addr;
+  return addr.startsWith("whatsapp:") ? addr : `whatsapp:${addr}`;
 }
+TWILIO_FROM = normalizeWa(TWILIO_FROM);
+
+const twilioClient = (TWILIO_SID && TWILIO_TOKEN) ? twilio(TWILIO_SID, TWILIO_TOKEN) : null;
 
 // ========= HELPERS =========
-function tenantRef(tenantId) {
-  return db.collection("tenants").doc(tenantId);
+function userRef(uid) {
+  return db.collection("users").doc(uid);
 }
 
-function phoneHash(tenantId, phoneE164) {
-  return crypto.createHash("sha256").update(`${tenantId}:${phoneE164}`).digest("hex");
+function phoneHash(uid, phoneE164) {
+  return crypto.createHash("sha256").update(`${uid}:${phoneE164}`).digest("hex");
 }
 
-async function addLog(tenantId, payload) {
-  await tenantRef(tenantId).collection("logs").add({
+async function addLog(uid, payload) {
+  await userRef(uid).collection("logs").add({
     ...payload,
     ts: admin.firestore.FieldValue.serverTimestamp(),
   });
+}
+
+async function getMediaUrl(uid, mediaId) {
+  if (!mediaId) return null;
+  const doc = await userRef(uid).collection("media").doc(mediaId).get();
+  return doc.exists ? doc.data().url : null;
+}
+
+function replyTwiml(res, text) {
+  const twiml = new MessagingResponse();
+  if (text) twiml.message(text);
+  res.type("text/xml").send(twiml.toString());
 }
 
 async function requireAuth(req, res, next) {
@@ -73,341 +73,365 @@ async function requireAuth(req, res, next) {
     const auth = req.headers.authorization || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
     if (!token) return res.status(401).json({ error: "Missing token" });
-
     const decoded = await admin.auth().verifyIdToken(token);
-    req.user = decoded;
-    req.tenantId = DEFAULT_TENANT;
+    req.uid = decoded.uid;
     return next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid token" });
   }
 }
 
-// ========= CONTACTS =========
+function in24hWindow(lastInboundAt, now = Date.now()) {
+  if (!lastInboundAt) return false;
+  const last = lastInboundAt.toDate ? lastInboundAt.toDate().getTime() : new Date(lastInboundAt).getTime();
+  return (now - last) < 24 * 60 * 60 * 1000;
+}
+
+// Fetch contacts for a schedule target with pagination cursor.
+// Returns { contacts: [{id, ...data}], nextCursor: <docId|null>, totalFetched }
+async function fetchContactsForTarget(uid, target, cursorDocId = null, limit = 100) {
+  let q = userRef(uid).collection("contacts")
+    .where("status", "==", "active")
+    .orderBy(admin.firestore.FieldPath.documentId());
+
+  if (cursorDocId) q = q.startAfter(cursorDocId);
+
+  // all
+  if (!target || target.type === "all") {
+    const snap = await q.limit(limit).get();
+    const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const nextCursor = snap.size === limit ? snap.docs[snap.docs.length - 1].id : null;
+    return { contacts: docs, nextCursor, totalFetched: snap.size };
+  }
+
+  // tags (array-contains-any max 10)
+  if (target.type === "tags") {
+    const tags = Array.isArray(target.tags) ? target.tags.filter(Boolean) : [];
+    if (tags.length === 0) return { contacts: [], nextCursor: null, totalFetched: 0 };
+
+    // If >10 tags, we chunk and merge (best-effort). Cursor/pagination becomes messy across chunks.
+    // Practical approach: limit tags to 10 in UI. Here we just take first 10 to keep it consistent.
+    const tagsSafe = tags.slice(0, 10);
+
+    const snap = await q
+      .where("tags", "array-contains-any", tagsSafe)
+      .limit(limit)
+      .get();
+
+    const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const nextCursor = snap.size === limit ? snap.docs[snap.docs.length - 1].id : null;
+    return { contacts: docs, nextCursor, totalFetched: snap.size };
+  }
+
+  return { contacts: [], nextCursor: null, totalFetched: 0 };
+}
+
+async function sendTeaserOrTemplate({ uid, contact, campaign, nowMs }) {
+  if (!twilioClient) throw new Error("twilio_not_configured");
+  if (!TWILIO_FROM) throw new Error("twilio_from_missing");
+
+  const to = normalizeWa(contact.phoneE164);
+  const inside = in24hWindow(contact.lastInboundAt, nowMs);
+
+  // Inside 24h: freeform + media
+  if (inside) {
+    const msgConfig = {
+      from: TWILIO_FROM,
+      to,
+      body: campaign.teaserText || "",
+    };
+
+    const mediaUrl = await getMediaUrl(uid, campaign.teaserMediaId);
+    if (mediaUrl) msgConfig.mediaUrl = [mediaUrl];
+
+    return await twilioClient.messages.create(msgConfig);
+  }
+
+  // Outside 24h: MUST use approved template / contentSid
+  if (!campaign.contentSid) {
+    throw new Error("outside_24h_no_template");
+  }
+
+  const msgConfig = {
+    from: TWILIO_FROM,
+    to,
+    contentSid: campaign.contentSid,
+    // Twilio Content variables must be a JSON string. Keys are "1","2",...
+    contentVariables: JSON.stringify({
+      "1": contact.name || "hola",
+    }),
+  };
+
+  return await twilioClient.messages.create(msgConfig);
+}
+
+// ========= API ENDPOINTS =========
 app.get("/api/contacts", requireAuth, async (req, res) => {
-  const snap = await tenantRef(req.tenantId)
-    .collection("contacts")
-    .orderBy("createdAt", "desc")
-    .limit(1000)
-    .get();
-  return res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  const snap = await userRef(req.uid).collection("contacts")
+    .orderBy("createdAt", "desc").limit(1000).get();
+  return res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
 app.post("/api/contacts", requireAuth, async (req, res) => {
   const { name, phoneE164, tags = [], status = "active" } = req.body || {};
   if (!name || !phoneE164) return res.status(400).json({ error: "name and phoneE164 required" });
 
-  const doc = await tenantRef(req.tenantId).collection("contacts").add({
-    name,
-    phoneE164,
-    tags,
-    status,
+  const doc = await userRef(req.uid).collection("contacts").add({
+    name, phoneE164, tags, status,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
-
   return res.json({ id: doc.id });
 });
 
-// ========= CAMPAIGNS =========
 app.get("/api/campaigns", requireAuth, async (req, res) => {
-  const snap = await tenantRef(req.tenantId)
-    .collection("campaigns")
-    .orderBy("createdAt", "desc")
-    .limit(200)
-    .get();
-  return res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+  const snap = await userRef(req.uid).collection("campaigns")
+    .orderBy("createdAt", "desc").limit(500).get();
+  return res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
 });
 
 app.post("/api/campaigns", requireAuth, async (req, res) => {
-  const {
-    title,
-    teaserText,
-    detailText,
-    rejectText,
-    errorText,
-    teaserMediaUrl = null,
-    detailMediaUrl = null,
-  } = req.body || {};
-
-  if (!title || !teaserText || !detailText || !rejectText || !errorText) {
-    return res.status(400).json({ error: "missing required campaign fields" });
+  const data = req.body || {};
+  if (!data.title || !data.teaserText || !data.detailText) {
+    return res.status(400).json({ error: "missing required fields: title, teaserText, detailText" });
   }
 
-  const doc = await tenantRef(req.tenantId).collection("campaigns").add({
-    title,
-    teaserText,
-    detailText,
-    rejectText,
-    errorText,
-    teaserMediaUrl,
-    detailMediaUrl,
+  const doc = await userRef(req.uid).collection("campaigns").add({
+    ...data,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
-
   return res.json({ id: doc.id });
 });
 
-// ========= SEND (enqueue jobs in Firestore) =========
-app.post("/api/send", requireAuth, async (req, res) => {
-  const { campaignId, tag } = req.body || {};
-  if (!campaignId || !tag) return res.status(400).json({ error: "campaignId and tag required" });
+// ========= DEBUG (temporal) =========
 
-  const contactsSnap = await tenantRef(req.tenantId)
-    .collection("contacts")
-    .where("tags", "array-contains", tag)
-    .where("status", "==", "active")
-    .limit(2000)
-    .get();
+// ========= WORKER: PROCESS SCHEDULES (all/tags) =========
+// Call via cron with header x-cron-secret: CRON_SECRET
+app.post("/jobs/processSchedules", async (req, res) => {
+  const secret = req.headers["x-cron-secret"];
+  if (!CRON_SECRET || secret !== CRON_SECRET) return res.status(401).send("Unauthorized");
 
-  const batch = db.batch();
-  contactsSnap.docs.forEach((docSnap) => {
-    const c = docSnap.data();
-    const jobRef = tenantRef(req.tenantId).collection("sendJobs").doc();
-    batch.set(jobRef, {
-      campaignId,
-      phoneE164: c.phoneE164,
-      status: "pending",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  });
-  await batch.commit();
+  const nowTs = admin.firestore.Timestamp.now();
+  const nowMs = Date.now();
 
-  await addLog(req.tenantId, {
-    type: "broadcast_enqueued",
-    campaignId,
-    tag,
-    count: contactsSnap.size,
-  });
-
-  return res.json({ ok: true, enqueued: contactsSnap.size });
-});
-
-// ========= WORKER (drain sendJobs in small batches) =========
-app.post("/jobs/processSendJobs", async (req, res) => {
-  const tenantId = DEFAULT_TENANT;
-  const limit = Number(req.query.limit || 25);
-
-  const jobsSnap = await tenantRef(tenantId)
-    .collection("sendJobs")
+  // Fetch due schedules across all users
+  const schedulesSnap = await db.collectionGroup("schedules")
     .where("status", "==", "pending")
-    .orderBy("createdAt", "asc")
-    .limit(limit)
+    .where("scheduledAt", "<=", nowTs)
+    .orderBy("scheduledAt", "asc")
+    .limit(25)
     .get();
 
-  if (jobsSnap.empty) return res.json({ processed: 0, note: "no pending jobs" });
+  if (schedulesSnap.empty) return res.json({ processedSchedules: 0, processedMessages: 0 });
 
-  const campaignCache = new Map();
-  let processed = 0;
+  let processedSchedules = 0;
+  let processedMessages = 0;
 
-  for (const jobDoc of jobsSnap.docs) {
-    const job = jobDoc.data();
-    const { campaignId, phoneE164 } = job;
+  for (const schDoc of schedulesSnap.docs) {
+    const schedule = schDoc.data();
+    const uid = schDoc.ref.parent.parent.id; // users/{uid}/schedules/{id}
+
+    // Soft-lock schedule to avoid double processing (best-effort)
+    try {
+      await schDoc.ref.update({
+        status: "processing",
+        processingAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (_) {
+      continue;
+    }
 
     try {
-      if (!campaignCache.has(campaignId)) {
-        const cdoc = await tenantRef(tenantId).collection("campaigns").doc(campaignId).get();
-        if (!cdoc.exists) {
-          await jobDoc.ref.update({ status: "failed", error: "campaign_not_found" });
-          continue;
-        }
-        campaignCache.set(campaignId, { id: cdoc.id, ...cdoc.data() });
+      // Load campaign
+      const campSnap = await userRef(uid).collection("campaigns").doc(schedule.campaignId).get();
+      if (!campSnap.exists) {
+        await schDoc.ref.update({ status: "failed", error: "campaign_not_found" });
+        continue;
       }
-      const campaign = campaignCache.get(campaignId);
+      const campaign = { id: campSnap.id, ...campSnap.data() };
 
-      const ph = phoneHash(tenantId, phoneE164);
-      const stateRef = tenantRef(tenantId).collection("userStates").doc(ph);
-      const st = await stateRef.get();
+      // Paginate contacts per schedule to avoid timeouts
+      const cursor = schedule.cursor || null; // store last contact docId
+      const perRunLimit = Number(req.query.contactLimit || 50);
 
-      if (st.exists && st.data().state === "WAITING_CHOICE") {
-        await jobDoc.ref.update({ status: "skipped", reason: "already_waiting" });
+      const { contacts, nextCursor } = await fetchContactsForTarget(
+        uid,
+        schedule.target || { type: "all" },
+        cursor,
+        perRunLimit
+      );
+
+      // Nothing to send => mark as sent (done)
+      if (contacts.length === 0) {
+        await schDoc.ref.update({
+          status: "sent",
+          doneAt: admin.firestore.FieldValue.serverTimestamp(),
+          cursor: null,
+          processedCount: schedule.processedCount || 0,
+          note: "no_contacts_or_done",
+        });
+        processedSchedules++;
         continue;
       }
 
-      const msg = await twilioClient.messages.create({
-        from: TWILIO_FROM,
-        to: `whatsapp:${phoneE164}`,
-        body: campaign.teaserText,
-      });
+      // Send messages
+      for (const contact of contacts) {
+        try {
+          const msg = await sendTeaserOrTemplate({ uid, contact, campaign, nowMs });
+          processedMessages++;
 
-      await tenantRef(tenantId).collection("outbound").doc(msg.sid).set({
-        sid: msg.sid,
-        campaignId,
-        to: phoneE164,
-        type: "teaser",
-        status: msg.status || "queued",
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+          await userRef(uid).collection("outbound").doc(msg.sid).set({
+            sid: msg.sid,
+            scheduleId: schDoc.id,
+            campaignId: campaign.id,
+            to: contact.phoneE164,
+            type: "teaser",
+            status: msg.status || "queued",
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
 
-      await stateRef.set(
-        {
-          activeCampaignId: campaignId,
-          state: "WAITING_CHOICE",
-          invalidCount: 0,
+          // Set user state (WAITING_CHOICE)
+          const ph = phoneHash(uid, contact.phoneE164);
+          await userRef(uid).collection("userStates").doc(ph).set({
+            activeCampaignId: campaign.id,
+            state: "WAITING_CHOICE",
+            invalidCount: 0,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+
+        } catch (e) {
+          await addLog(uid, {
+            type: "send_failed",
+            scheduleId: schDoc.id,
+            campaignId: campaign.id,
+            to: contact.phoneE164,
+            error: String(e.message || e),
+          });
+        }
+      }
+
+      // Update schedule progress
+      const newProcessedCount = (schedule.processedCount || 0) + contacts.length;
+
+      if (nextCursor) {
+        // More contacts remain
+        await schDoc.ref.update({
+          status: "pending", // put back to pending so cron can pick it again
+          cursor: nextCursor,
+          processedCount: newProcessedCount,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+        });
+      } else {
+        // Done
+        await schDoc.ref.update({
+          status: "sent",
+          cursor: null,
+          processedCount: newProcessedCount,
+          doneAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        processedSchedules++;
+      }
 
-      await jobDoc.ref.update({
-        status: "sent",
-        sid: msg.sid,
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      processed++;
     } catch (e) {
-      await jobDoc.ref.update({ status: "failed", error: String(e.message || e) });
+      await schDoc.ref.update({
+        status: "failed",
+        error: String(e.message || e),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
     }
   }
 
-  return res.json({ processed });
+  return res.json({ processedSchedules, processedMessages });
 });
 
 // ========= TWILIO WEBHOOK (inbound) =========
 app.post("/twilio/inbound", express.urlencoded({ extended: false }), async (req, res) => {
-  const tenantId = DEFAULT_TENANT;
-
-  const fromRaw = (req.body.From || "").trim();
-  const from = fromRaw.replace("whatsapp:", "").trim();
-  const body = (req.body.Body || "").trim();
-  const sid = (req.body.MessageSid || "").trim();
-
-  const inboundRef = tenantRef(tenantId).collection("inbound").doc(sid);
-  const exist = await inboundRef.get();
-  if (exist.exists) return replyTwiml(res, "OK");
-
-  await inboundRef.set({
-    sid,
-    from,
-    body,
-    receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
   try {
-    const replyText = await processInbound(tenantId, from, body);
-    if (replyText) {
-      return replyTwiml(res, replyText);
-    }
-  } catch (e) {
-    await addLog(tenantId, { type: "inbound_error", from, error: String(e.message || e) });
-    return replyTwiml(res, "Ups, tuvimos un problema. Intenta de nuevo 🙏");
-  }
+    const fromRaw = String(req.body.From || "").trim(); // "whatsapp:+52..."
+    const from = fromRaw.replace("whatsapp:", "").trim();
+    const body = String(req.body.Body || "").trim();
 
-  return replyTwiml(res, "OK");
-});
+    // Find user by contact phone (best-effort; for internal use)
+    const contactQuery = await db.collectionGroup("contacts")
+      .where("phoneE164", "==", from)
+      .limit(1)
+      .get();
 
-async function processInbound(tenantId, fromPhoneE164, bodyRaw) {
-  const body = String(bodyRaw || "").trim();
-  const ph = phoneHash(tenantId, fromPhoneE164);
+    if (contactQuery.empty) return replyTwiml(res, "No reconocido.");
 
-  const stateRef = tenantRef(tenantId).collection("userStates").doc(ph);
-  const stSnap = await stateRef.get();
+    const contactRef = contactQuery.docs[0].ref;
+    const uid = contactRef.parent.parent.id;
 
-  const stData = stSnap.exists ? stSnap.data() : null;
+    // open 24h window
+    await contactRef.set({
+      lastInboundAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
-  // Fallback flow: user is not currently in an active campaign choice.
-  if (!stData || stData.state !== "WAITING_CHOICE" || !stData.activeCampaignId) {
-    // If we were already waiting on fallback choice, interpret 1/2.
-    if (stData && stData.state === "WAITING_FALLBACK_CHOICE") {
-      if (body === "1") {
-        await stateRef.set(
-          {
-            state: "FALLBACK_OPTIN",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-        await addLog(tenantId, { type: "fallback_optin", phoneHash: ph });
-        return "Perfecto ✅ En breve te comparto más info.\n\nSi quieres recibir una campaña, espera un mensaje con opciones 1/2.";
-      }
-      if (body === "2") {
-        await stateRef.set(
-          {
-            state: "FALLBACK_OPTOUT",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          },
-          { merge: true }
-        );
-        await addLog(tenantId, { type: "fallback_optout", phoneHash: ph });
-        return "Listo 👍 No te mando más info.\n\nSi luego quieres, escribe 1.";
-      }
-      await addLog(tenantId, { type: "fallback_invalid", phoneHash: ph, inboundBody: body });
-      return "No entendí 😅 Responde 1 o 2.";
+    // read state
+    const ph = phoneHash(uid, from);
+    const stateRef = userRef(uid).collection("userStates").doc(ph);
+    const stSnap = await stateRef.get();
+    const st = stSnap.exists ? stSnap.data() : null;
+
+    if (!st || st.state !== "WAITING_CHOICE" || !st.activeCampaignId) {
+      return replyTwiml(res, "Hola 👋 En breve te contactamos. Si recibes una campaña, responde 1 o 2.");
     }
 
-    // Start fallback choice state for any other inbound.
-    await stateRef.set(
-      {
-        state: "WAITING_FALLBACK_CHOICE",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        lastInboundBody: body,
-      },
-      { merge: true }
-    );
-    await addLog(tenantId, { type: "fallback_prompt", phoneHash: ph, inboundBody: body });
-    return FALLBACK_TEXT;
-  }
+    // load campaign
+    const campSnap = await userRef(uid).collection("campaigns").doc(st.activeCampaignId).get();
+    if (!campSnap.exists) return replyTwiml(res, "Campaña no encontrada.");
 
-  const { activeCampaignId, invalidCount = 0 } = stData;
-  const campSnap = await tenantRef(tenantId).collection("campaigns").doc(activeCampaignId).get();
-  if (!campSnap.exists) return null;
+    const campaign = campSnap.data();
 
-  const campaign = campSnap.data();
+    let replyText = "";
+    let mediaId = null;
+    let newState = "WAITING_CHOICE";
+    let newInvalid = st.invalidCount || 0;
 
-  let sendText;
-  let messageType;
-  let newState = "WAITING_CHOICE";
-  let newInvalid = invalidCount;
+    if (body === "1") {
+      replyText = campaign.detailText;
+      mediaId = campaign.detailMediaId || null;
+      newState = "DONE";
+    } else if (body === "2") {
+      replyText = campaign.rejectText || "Listo 👍";
+      newState = "DONE";
+    } else {
+      newInvalid++;
+      replyText = campaign.errorText || "No entendí 😅 Responde 1 o 2.";
+      if (newInvalid >= 3) newState = "DONE";
+    }
 
-  if (body === "1") {
-    sendText = campaign.detailText;
-    messageType = "detail";
-    newState = "DONE";
-  } else if (body === "2") {
-    sendText = campaign.rejectText;
-    messageType = "reject";
-    newState = "DONE";
-  } else {
-    sendText = campaign.errorText;
-    messageType = "error";
-    newInvalid = invalidCount + 1;
-    if (newInvalid >= 3) newState = "DONE";
-  }
+    // respond via Twilio outbound message (not TwiML body) so we can attach media
+    const mediaUrl = await getMediaUrl(uid, mediaId);
+    const msgOptions = {
+      from: TWILIO_FROM,
+      to: normalizeWa(from),
+      body: replyText,
+    };
+    if (mediaUrl) msgOptions.mediaUrl = [mediaUrl];
 
-  const msg = await twilioClient.messages.create({
-    from: TWILIO_FROM,
-    to: `whatsapp:${fromPhoneE164}`,
-    body: sendText,
-  });
+    if (twilioClient) {
+      await twilioClient.messages.create(msgOptions);
+    } else {
+      await addLog(uid, { type: "inbound_reply_skipped", reason: "twilio_not_configured", from, body });
+    }
 
-  await tenantRef(tenantId).collection("outbound").doc(msg.sid).set({
-    sid: msg.sid,
-    campaignId: activeCampaignId,
-    to: fromPhoneE164,
-    type: messageType,
-    status: msg.status || "queued",
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  await stateRef.set(
-    {
+    await stateRef.set({
       state: newState,
       invalidCount: newInvalid,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    },
-    { merge: true }
-  );
+    }, { merge: true });
 
-  await addLog(tenantId, {
-    type: "inbound_processed",
-    campaignId: activeCampaignId,
-    phoneHash: ph,
-    inboundBody: body,
-    result: messageType,
-  });
+    await addLog(uid, { type: "inbound_processed", from, body, result: newState });
 
-  return null;
-}
+    // empty TwiML response
+    return replyTwiml(res, "");
+  } catch (e) {
+    return replyTwiml(res, "Ups, hubo un error. Intenta de nuevo 🙏");
+  }
+});
 
 exports.app = onRequest(app);
-    
