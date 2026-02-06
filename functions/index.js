@@ -346,6 +346,13 @@ app.post("/jobs/processSchedules", async (req, res) => {
   return res.json({ processedSchedules, processedMessages });
 });
 
+process.on("unhandledRejection", (reason) => {
+  console.error("UNHANDLED_REJECTION", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT_EXCEPTION", err);
+});
+
 // ========= TWILIO WEBHOOK (inbound) =========
 app.post("/twilio/inbound", express.urlencoded({ extended: false }), async (req, res) => {
   try {
