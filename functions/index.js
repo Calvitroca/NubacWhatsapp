@@ -208,142 +208,157 @@ app.post("/api/campaigns", requireAuth, async (req, res) => {
 
 // ========= WORKER: PROCESS SCHEDULES (all/tags) =========
 // Call via cron with header x-cron-secret: CRON_SECRET
+// (Recomendado) arriba del archivo, una sola vez:
+process.on("unhandledRejection", (reason) => console.error("UNHANDLED_REJECTION", reason));
+process.on("uncaughtException", (err) => console.error("UNCAUGHT_EXCEPTION", err));
+
 app.post("/jobs/processSchedules", async (req, res) => {
-  const secret = req.headers["x-cron-secret"];
-  if (!CRON_SECRET || secret !== CRON_SECRET) return res.status(401).send("Unauthorized");
+  try {
+    const secret = req.headers["x-cron-secret"];
+    if (!CRON_SECRET || secret !== CRON_SECRET) return res.status(401).send("Unauthorized");
 
-  const nowTs = admin.firestore.Timestamp.now();
-  const nowMs = Date.now();
+    const nowTs = admin.firestore.Timestamp.now();
+    const nowMs = Date.now();
 
-  // Fetch due schedules across all users
-  const schedulesSnap = await db.collectionGroup("schedules")
-    .where("status", "==", "pending")
-    .where("scheduledAt", "<=", nowTs)
-    .orderBy("scheduledAt", "asc")
-    .limit(25)
-    .get();
+    console.log("[processSchedules] hit", {
+      at: new Date().toISOString(),
+      contactLimit: req.query.contactLimit,
+    });
 
-  if (schedulesSnap.empty) return res.json({ processedSchedules: 0, processedMessages: 0 });
+    // ✅ OJO: este query puede tirar "missing index" => ahora sí lo cachamos
+    const schedulesSnap = await db.collectionGroup("schedules")
+      .where("status", "==", "pending")
+      .where("scheduledAt", "<=", nowTs)
+      .orderBy("scheduledAt", "asc")
+      .limit(25)
+      .get();
 
-  let processedSchedules = 0;
-  let processedMessages = 0;
-
-  for (const schDoc of schedulesSnap.docs) {
-    const schedule = schDoc.data();
-    const uid = schDoc.ref.parent.parent.id; // users/{uid}/schedules/{id}
-
-    // Soft-lock schedule to avoid double processing (best-effort)
-    try {
-      await schDoc.ref.update({
-        status: "processing",
-        processingAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    } catch (_) {
-      continue;
+    if (schedulesSnap.empty) {
+      return res.json({ processedSchedules: 0, processedMessages: 0 });
     }
 
-    try {
-      // Load campaign
-      const campSnap = await userRef(uid).collection("campaigns").doc(schedule.campaignId).get();
-      if (!campSnap.exists) {
-        await schDoc.ref.update({ status: "failed", error: "campaign_not_found" });
-        continue;
-      }
-      const campaign = { id: campSnap.id, ...campSnap.data() };
+    let processedSchedules = 0;
+    let processedMessages = 0;
 
-      // Paginate contacts per schedule to avoid timeouts
-      const cursor = schedule.cursor || null; // store last contact docId
-      const perRunLimit = Number(req.query.contactLimit || 50);
+    for (const schDoc of schedulesSnap.docs) {
+      const schedule = schDoc.data();
 
-      const { contacts, nextCursor } = await fetchContactsForTarget(
-        uid,
-        schedule.target || { type: "all" },
-        cursor,
-        perRunLimit
-      );
+      // ⚠️ Más seguro que parent.parent.id (aunque usualmente funciona)
+      const uid = schDoc.ref.path.split("/")[1]; // "users/{uid}/schedules/{id}"
 
-      // Nothing to send => mark as sent (done)
-      if (contacts.length === 0) {
+      // Soft-lock schedule
+      try {
         await schDoc.ref.update({
-          status: "sent",
-          doneAt: admin.firestore.FieldValue.serverTimestamp(),
-          cursor: null,
-          processedCount: schedule.processedCount || 0,
-          note: "no_contacts_or_done",
+          status: "processing",
+          processingAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-        processedSchedules++;
+      } catch (lockErr) {
+        console.warn("[processSchedules] lock_failed", schDoc.ref.path, lockErr?.message || lockErr);
         continue;
       }
 
-      // Send messages
-      for (const contact of contacts) {
-        try {
-          const msg = await sendTeaserOrTemplate({ uid, contact, campaign, nowMs });
-          processedMessages++;
-
-          await userRef(uid).collection("outbound").doc(msg.sid).set({
-            sid: msg.sid,
-            scheduleId: schDoc.id,
-            campaignId: campaign.id,
-            to: contact.phoneE164,
-            type: "teaser",
-            status: msg.status || "queued",
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          // Set user state (WAITING_CHOICE)
-          const ph = phoneHash(uid, contact.phoneE164);
-          await userRef(uid).collection("userStates").doc(ph).set({
-            activeCampaignId: campaign.id,
-            state: "WAITING_CHOICE",
-            invalidCount: 0,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          }, { merge: true });
-
-        } catch (e) {
-          await addLog(uid, {
-            type: "send_failed",
-            scheduleId: schDoc.id,
-            campaignId: campaign.id,
-            to: contact.phoneE164,
-            error: String(e.message || e),
-          });
+      try {
+        // Load campaign
+        const campSnap = await userRef(uid).collection("campaigns").doc(schedule.campaignId).get();
+        if (!campSnap.exists) {
+          await schDoc.ref.update({ status: "failed", error: "campaign_not_found" });
+          continue;
         }
-      }
+        const campaign = { id: campSnap.id, ...campSnap.data() };
 
-      // Update schedule progress
-      const newProcessedCount = (schedule.processedCount || 0) + contacts.length;
+        const cursor = schedule.cursor || null;
+        const perRunLimit = Number(req.query.contactLimit || 50);
 
-      if (nextCursor) {
-        // More contacts remain
+        const { contacts, nextCursor } = await fetchContactsForTarget(
+          uid,
+          schedule.target || { type: "all" },
+          cursor,
+          perRunLimit
+        );
+
+        if (contacts.length === 0) {
+          await schDoc.ref.update({
+            status: "sent",
+            doneAt: admin.firestore.FieldValue.serverTimestamp(),
+            cursor: null,
+            processedCount: schedule.processedCount || 0,
+            note: "no_contacts_or_done",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          processedSchedules++;
+          continue;
+        }
+
+        for (const contact of contacts) {
+          try {
+            const msg = await sendTeaserOrTemplate({ uid, contact, campaign, nowMs });
+            processedMessages++;
+
+            await userRef(uid).collection("outbound").doc(msg.sid).set({
+              sid: msg.sid,
+              scheduleId: schDoc.id,
+              campaignId: campaign.id,
+              to: contact.phoneE164,
+              type: "teaser",
+              status: msg.status || "queued",
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            const ph = phoneHash(uid, contact.phoneE164);
+            await userRef(uid).collection("userStates").doc(ph).set({
+              activeCampaignId: campaign.id,
+              state: "WAITING_CHOICE",
+              invalidCount: 0,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            }, { merge: true });
+
+          } catch (e) {
+            await addLog(uid, {
+              type: "send_failed",
+              scheduleId: schDoc.id,
+              campaignId: campaign.id,
+              to: contact.phoneE164,
+              error: String(e?.message || e),
+            });
+          }
+        }
+
+        const newProcessedCount = (schedule.processedCount || 0) + contacts.length;
+
+        if (nextCursor) {
+          await schDoc.ref.update({
+            status: "pending",
+            cursor: nextCursor,
+            processedCount: newProcessedCount,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+        } else {
+          await schDoc.ref.update({
+            status: "sent",
+            cursor: null,
+            processedCount: newProcessedCount,
+            doneAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          processedSchedules++;
+        }
+
+      } catch (e) {
         await schDoc.ref.update({
-          status: "pending", // put back to pending so cron can pick it again
-          cursor: nextCursor,
-          processedCount: newProcessedCount,
+          status: "failed",
+          error: String(e?.message || e),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
-      } else {
-        // Done
-        await schDoc.ref.update({
-          status: "sent",
-          cursor: null,
-          processedCount: newProcessedCount,
-          doneAt: admin.firestore.FieldValue.serverTimestamp(),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-        processedSchedules++;
       }
-
-    } catch (e) {
-      await schDoc.ref.update({
-        status: "failed",
-        error: String(e.message || e),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
     }
-  }
 
-  return res.json({ processedSchedules, processedMessages });
+    return res.json({ processedSchedules, processedMessages });
+
+  } catch (e) {
+    // ✅ aquí caerán: missing index, permisos, bugs antes del loop, etc.
+    console.error("[processSchedules] FATAL", e?.stack || e);
+    return res.status(500).send("Internal Server Error");
+  }
 });
 
 process.on("unhandledRejection", (reason) => {

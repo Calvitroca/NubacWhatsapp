@@ -2,22 +2,37 @@
 // ===== Auth + API config =====
 const API_BASE = localStorage.getItem("API_BASE") || ""; // ej: https://app-xxxxx-uc.a.run.app
 
-const firebaseConfig = {
-    apiKey: "AIzaSyD2ZNznq-2l9hMahVzyT9XwOI2hZjzz7gU",
-    authDomain: "nubacwhatsapp.firebaseapp.com",
-    projectId: "nubacwhatsapp",
-    storageBucket: "nubacwhatsapp.firebasestorage.app",
-    messagingSenderId: "378836642199",
-    appId: "1:378836642199:web:34241484eb04c75137fcd2",
-    measurementId: "G-5096DDYHL2"
-  };
-
 firebase.initializeApp(firebaseConfig);
+
 const auth = firebase.auth();
-const dbFS = firebase.firestore(); // 👈 PÉGALO AQUÍ
+const dbFS = firebase.firestore();
 const provider = new firebase.auth.GoogleAuthProvider();
 
 let currentIdToken = null;
+
+async function ensureUserDoc(user) {
+  if (!user) return;
+  try {
+    const userRef = dbFS.collection("users").doc(user.uid);
+    const snapshot = await userRef.get();
+    const ts = firebase.firestore.FieldValue.serverTimestamp();
+
+    const updates = {
+      lastLoginAt: ts,
+      active: true,
+      email: user.email || null,
+      displayName: user.displayName || null,
+    };
+
+    if (!snapshot.exists) {
+      await userRef.set({ createdAt: ts, ...updates }, { merge: true });
+    } else {
+      await userRef.set(updates, { merge: true });
+    }
+  } catch (e) {
+    console.warn("Error ensuring user doc in Firestore:", e);
+  }
+}
 
 async function getIdToken() {
   const u = auth.currentUser;
@@ -51,10 +66,13 @@ document.getElementById("btnLogout")?.addEventListener("click", async () => {
   await auth.signOut();
 });
 
+// --- SINGLE Auth Observer ---
 auth.onAuthStateChanged(async (user) => {
+  if (user) await ensureUserDoc(user);
+
   setAuthUI(user);
   await getIdToken();
-  render(); // re-render cuando cambia sesión
+  render();
 });
 
 function requireLoginOrShowGate() {
@@ -74,6 +92,7 @@ function requireLoginOrShowGate() {
 
   return false;
 }
+
 /* WhatsApp Sender — Demo SPA (LocalStorage) */
 
 const DB_KEY = "wa_sender_db_v1";
