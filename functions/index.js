@@ -204,6 +204,115 @@ app.post("/api/campaigns", requireAuth, async (req, res) => {
   return res.json({ id: doc.id });
 });
 
+// --- NEW INSTANT MESSAGING ENDPOINTS ---
+
+// A) Envio inmediato individual
+app.post("/api/send/now", requireAuth, async (req, res) => {
+  const { to, body, mediaUrl } = req.body || {};
+  
+  if (!twilioClient) return res.status(500).json({ error: "twilio_not_configured" });
+  if (!TWILIO_FROM) return res.status(500).json({ error: "twilio_from_missing" });
+  if (!to || !body) return res.status(400).json({ error: "Missing 'to' or 'body'" });
+
+  try {
+    const normalizedTo = normalizeWa(to);
+    const msgData = {
+      from: TWILIO_FROM,
+      to: normalizedTo,
+      body: body
+    };
+    if (mediaUrl) msgData.mediaUrl = [mediaUrl];
+
+    const message = await twilioClient.messages.create(msgData);
+
+    await addLog(req.uid, {
+      type: "manual_send_now",
+      to: normalizedTo,
+      sid: message.sid,
+      status: message.status
+    });
+
+    return res.json({ ok: true, sid: message.sid, status: message.status });
+  } catch (e) {
+    console.error("SendNow Error:", e);
+    await addLog(req.uid, { type: "manual_send_error", error: e.message, to });
+    return res.status(500).json({ error: e.message || "Twilio send failed" });
+  }
+});
+
+// B) Envio broadcast (loop pequeño)
+app.post("/api/send/broadcast", requireAuth, async (req, res) => {
+  const { recipients, body, mediaUrl, limit = 50 } = req.body || {};
+
+  if (!twilioClient) return res.status(500).json({ error: "twilio_not_configured" });
+  if (!TWILIO_FROM) return res.status(500).json({ error: "twilio_from_missing" });
+  
+  if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+    return res.status(400).json({ error: "recipients array required" });
+  }
+  if (!body) return res.status(400).json({ error: "body required" });
+
+  const hardLimit = 200;
+  const effectiveLimit = Math.min(Number(limit), hardLimit);
+  const targets = recipients.slice(0, effectiveLimit);
+
+  const results = [];
+  let sentCount = 0;
+
+  // Secuencial para evitar rate limits agresivos en cuentas estándar
+  for (const recipient of targets) {
+    const normalizedTo = normalizeWa(recipient);
+    try {
+      const msgData = {
+        from: TWILIO_FROM,
+        to: normalizedTo,
+        body: body
+      };
+      if (mediaUrl) msgData.mediaUrl = [mediaUrl];
+
+      const message = await twilioClient.messages.create(msgData);
+      results.push({ to: normalizedTo, sid: message.sid, status: message.status });
+      sentCount++;
+    } catch (e) {
+      results.push({ to: normalizedTo, error: e.message });
+    }
+  }
+
+  await addLog(req.uid, {
+    type: "manual_broadcast",
+    totalRequested: recipients.length,
+    processed: targets.length,
+    sent: sentCount
+  });
+
+  return res.json({ ok: true, sent: sentCount, results });
+});
+
+// C) Test Self
+app.post("/api/send/test-self", requireAuth, async (req, res) => {
+  const { to } = req.body || {};
+  
+  if (!twilioClient || !TWILIO_FROM) return res.status(500).json({ error: "twilio_not_configured" });
+  
+  // Si no mandan "to", intentamos fallar con error claro (o podrías buscar en DB el usuario, 
+  // pero "req.uid" es el ID de firebase, y tu colección contacts no necesariamente tiene el teléfono del dueño).
+  // Mejor requerimos "to".
+  if (!to) return res.status(400).json({ error: "Please provide 'to' phone number for test." });
+
+  try {
+    const normalizedTo = normalizeWa(to);
+    const message = await twilioClient.messages.create({
+      from: TWILIO_FROM,
+      to: normalizedTo,
+      body: "Prueba Nubac ✅"
+    });
+
+    return res.json({ ok: true, sid: message.sid, status: message.status });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
 // ========= DEBUG (temporal) =========
 
 // ========= WORKER: PROCESS SCHEDULES (all/tags) =========
