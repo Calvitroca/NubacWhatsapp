@@ -1,4 +1,3 @@
-
 // ===== Auth + API config =====
 const API_BASE = localStorage.getItem("API_BASE") || ""; // ej: https://app-xxxxx-uc.a.run.app
 
@@ -908,22 +907,55 @@ function renderCalendar(db) {
     </div>
   `;
 
-  $("#btnCreateSchedule")?.addEventListener("click", () => {
+  // === REFACTORIZADO: Lógica unificada dentro del listener ===
+  $("#btnCreateSchedule")?.addEventListener("click", async () => {
     const campaignId = $("#schCampaign").value;
     const tag = $("#schTag").value;
-    const sendAt = $("#schAt").value.trim() || "(sin fecha)";
+    const sendAtStr = $("#schAt").value.trim();
 
-    setDB((db2) => {
-      db2.schedules.push({
-        id: uid("sch"),
-        campaignId,
-        tag,
-        sendAt,
-        status: "pending",
-        createdAt: nowISO(),
+    if (!sendAtStr) return alert("Pon fecha/hora.");
+
+    const dt = new Date(sendAtStr);
+    if (Number.isNaN(dt.getTime())) return alert("Fecha inválida. Usa formato ISO o cambia a datetime-local.");
+
+    try {
+      if (!auth.currentUser) throw new Error("Debes iniciar sesión para guardar en Firestore.");
+
+      // 1. Crear documento en Firestore (una sola vez)
+      const docRef = await dbFS.collection("users").doc(auth.currentUser.uid)
+        .collection("schedules")
+        .add({
+          campaignId,
+          target: { type: "all" },
+          tag,
+          scheduledAt: firebase.firestore.Timestamp.fromDate(dt),
+          status: "pending",
+          processedCount: 0,
+          cursor: null,
+          createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+
+      // 2. Actualizar estado local con el ID real de Firestore
+      setDB((db2) => {
+        db2.schedules.push({
+          id: docRef.id,
+          campaignId,
+          tag,
+          sendAt: dt.toISOString(),
+          status: "pending",
+          createdAt: nowISO(),
+        });
       });
-    });
-    render();
+
+      // 3. Refrescar UI y notificar éxito
+      render();
+      alert("Schedule creado en Firestore ✅");
+
+    } catch (error) {
+      console.error(error);
+      alert("Error al crear schedule: " + error.message);
+    }
   });
 
   $$("[data-del]").forEach((b) => b.addEventListener("click", () => {
@@ -1136,4 +1168,4 @@ $("#btnSeedDemo").addEventListener("contextmenu", (e) => e.preventDefault());
 // auto-seed first time
 seedDemo(false);
 bindNav();
-navigate("dashboard");
+navigate("dashboard");  
