@@ -166,22 +166,32 @@ async function sendTeaserOrTemplate({ uid, contact, campaign, nowMs }) {
 }
 
 // ========= API ENDPOINTS =========
-app.get("/api/contacts", requireAuth, async (req, res) => {
-  const snap = await userRef(req.uid).collection("contacts")
-    .orderBy("createdAt", "desc").limit(1000).get();
-  return res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-});
+app.get("/api/campaigns", requireAuth, async (req, res) => {
+  try {
+    const isAdmin = !!req.user.admin;
+    const uidParam = req.query.uid;
 
-app.post("/api/contacts", requireAuth, async (req, res) => {
-  const { name, phoneE164, tags = [], status = "active" } = req.body || {};
-  if (!name || !phoneE164) return res.status(400).json({ error: "name and phoneE164 required" });
+    // admin + uid → ver campañas de ese usuario
+    const targetUid = (isAdmin && uidParam)
+      ? uidParam
+      : req.user.uid;
 
-  const doc = await userRef(req.uid).collection("contacts").add({
-    name, phoneE164, tags, status,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-  return res.json({ id: doc.id });
+    const snap = await db
+      .collection("users")
+      .doc(targetUid)
+      .collection("campaigns")
+      .get();
+
+    const campaigns = snap.docs.map(d => ({
+      id: d.id,
+      ...d.data(),
+    }));
+
+    return res.json(campaigns);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Failed to list campaigns" });
+  }
 });
 
 app.get("/api/campaigns", requireAuth, async (req, res) => {
@@ -562,6 +572,42 @@ app.post("/twilio/inbound", express.urlencoded({ extended: false }), async (req,
     return replyTwiml(res, "");
   } catch (e) {
     return replyTwiml(res, "Ups, hubo un error. Intenta de nuevo 🙏");
+  }
+});
+
+app.get("/debug/env", (req, res) => {
+  return res.json({
+    twilioConfigured: !!twilioClient,
+    from: TWILIO_FROM || null,
+    hasSid: !!TWILIO_SID,
+    hasToken: !!TWILIO_TOKEN,
+  });
+});
+
+// ⚠️ TEMPORAL: prueba Twilio sin Auth (protéjelo con secret)
+app.post("/debug/send", async (req, res) => {
+  try {
+    const secret = req.headers["x-debug-secret"];
+    if (!process.env.DEBUG_SECRET || secret !== process.env.DEBUG_SECRET) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { to, body } = req.body || {};
+    if (!to || !body) return res.status(400).json({ error: "to and body required" });
+
+    if (!twilioClient) return res.status(500).json({ error: "twilio_not_configured" });
+    if (!TWILIO_FROM) return res.status(500).json({ error: "twilio_from_missing" });
+
+    const msg = await twilioClient.messages.create({
+      from: TWILIO_FROM,
+      to: normalizeWa(to),
+      body
+    });
+
+    return res.json({ ok: true, sid: msg.sid, status: msg.status });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
